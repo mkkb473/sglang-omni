@@ -3,40 +3,61 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
-from transformers import AutoConfig, AutoProcessor, GenerationConfig
+from transformers import AutoConfig, GenerationConfig
 
-from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.models.moss_transcribe_diarize import (  # noqa: F401
     hf_config as _hf_config,
 )
-from sglang_omni.models.moss_transcribe_diarize.request_builders import (
-    make_moss_transcribe_diarize_scheduler_adapters,
-)
-from sglang_omni.scheduling.bootstrap import (
-    create_sglang_infrastructure_defer_cuda_graph,
-)
-from sglang_omni.scheduling.generation_batch_policy import (
-    build_generation_batch_overrides,
-    validate_generation_batch_policy,
-)
-from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-from sglang_omni.scheduling.sglang_backend import (
-    SGLangOutputProcessor,
-    build_sglang_server_args,
-)
 
-# Note (yichi): Budget for long-form input and let the checkpoint window cap it.
-_LONG_FORM_PROMPT_TOKENS = 72000
+# Note (yijiang): Dense buckets avoid CUDA-graph capture at padded sizes
+# we don't hit; pad-to-power-of-2 would tax a compute-bound encoder with
+# no cross-request batching yet.
+# Cap tuned to p99 audio duration ([1,8] covers up to ~4min)
+_DEFAULT_ENCODER_CHUNK_BUCKETS = list(range(1, 9))
 
 
-def _default_context_length(model_path: str, max_new_tokens: int) -> int:
+@contextmanager
+def _missing_additional_chat_templates_compat() -> Iterator[None]:
+    """Treat a missing optional chat-template directory as no extra templates."""
+    import transformers.processing_utils as processing_utils
+    import transformers.utils.hub as hub_utils
+    from huggingface_hub.errors import RepositoryNotFoundError
+
+    patched: list[tuple[Any, Any]] = []
+
+    def patch_list_repo_templates(module: Any) -> None:
+        original = getattr(module, "list_repo_templates", None)
+        if original is None:
+            return
+
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return original(*args, **kwargs)
+            except RepositoryNotFoundError as exc:
+                if "additional_chat_templates" in str(exc):
+                    return []
+                raise
+
+        setattr(module, "list_repo_templates", wrapped)
+        patched.append((module, original))
+
+    try:
+        patch_list_repo_templates(processing_utils)
+        patch_list_repo_templates(hub_utils)
+        yield
+    finally:
+        for module, original in reversed(patched):
+            setattr(module, "list_repo_templates", original)
+
+
+def _default_context_length(model_path: str) -> int:
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     text_config = getattr(config, "text_config", None)
-    max_positions = int(getattr(text_config, "max_position_embeddings", 40960))
-    return min(max_positions, _LONG_FORM_PROMPT_TOKENS + int(max_new_tokens))
+    return int(getattr(text_config, "max_position_embeddings", 131072))
 
 
 def _default_max_new_tokens(model_path: str) -> int:
@@ -55,96 +76,68 @@ def create_sglang_moss_transcribe_diarize_executor(
     max_running_requests: int = 16,
     max_new_tokens: int | None = None,
     context_length: int | None = None,
-    mem_fraction_static: float | None = None,
+    mem_fraction_static: float | None = 0.80,
     mm_embedding_cache_size_bytes: int = 0,
+    encoder_cache_size_bytes: int = 0,
     enable_torch_compile: bool = False,
-    request_build_max_workers: int = 2,
+    # note (yichi): MOSS-TD overlaps host collect starting at batch size 1;
+    # --decode-mode sync remains the operator opt-out.
+    enable_async_decode: bool = True,
+    async_decode_min_batch_size: int = 1,
+    prefill_coalesce_requests: int = 4,
+    prefill_coalesce_wait_ms: float = 12.0,
+    prefill_coalesce_when_idle: bool = True,
+    prefill_coalesce_requires_pending_builds: bool = True,
+    prefill_coalesce_after_builds_during_decode: bool = True,
+    encoder_chunk_buckets: list[int] | None = None,
+    encoder_torch_compile: bool = False,
+    encoder_max_batch_size: int = 2,
+    # note (yichi): 8 parallel mel extractions measured optimal; fewer starve
+    # the encoder feed, more oversubscribe the CPU.
+    request_build_max_workers: int = 8,
     request_build_max_pending: int | None = 16,
+    stream_emit_interval_s: float = 0.05,
     server_args_overrides: dict[str, Any] | None = None,
 ):
-    gpu_id = int(device.split(":")[-1]) if ":" in device else 0
-
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-    tokenizer = processor.tokenizer
-
-    resolved_max_new_tokens = (
-        int(max_new_tokens)
-        if max_new_tokens is not None
-        else _default_max_new_tokens(model_path)
-    )
-    resolved_context_length = (
-        int(context_length)
-        if context_length is not None
-        else _default_context_length(model_path, resolved_max_new_tokens)
+    from sglang_omni.models.moss_transcribe_diarize.engine_builder import (
+        MossTranscribeDiarizeEngineBuilder,
     )
 
-    overrides = build_generation_batch_overrides(
+    buckets = (
+        encoder_chunk_buckets
+        if encoder_chunk_buckets is not None
+        else _DEFAULT_ENCODER_CHUNK_BUCKETS
+    )
+    return MossTranscribeDiarizeEngineBuilder(
         max_running_requests=max_running_requests,
-        server_args_overrides=server_args_overrides,
-        disable_cuda_graph=False,
-        disable_overlap_schedule=True,
-        enable_torch_compile=enable_torch_compile,
+        max_new_tokens=max_new_tokens,
+        context_length=context_length,
         mem_fraction_static=mem_fraction_static,
-        max_prefill_tokens=4096,
-        chunked_prefill_size=4096,
-        sampling_backend="pytorch",
-        dtype=dtype,
-    )
-
-    server_args = build_sglang_server_args(
-        model_path,
-        context_length=resolved_context_length,
-        **overrides,
-    )
-    validate_generation_batch_policy(
-        model_name="MOSS-Transcribe-Diarize",
-        server_args=server_args,
-    )
-
-    want_cuda_graph, (
-        model_worker,
-        tree_cache,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        prefill_mgr,
-        decode_mgr,
-        model_config,
-    ) = create_sglang_infrastructure_defer_cuda_graph(
-        server_args,
-        gpu_id,
-        model_arch_override="MossTranscribeDiarizeForConditionalGeneration",
-    )
-
-    if want_cuda_graph:
-        model_worker.model_runner.init_device_graphs()
-
-    init_mm_embedding_cache(mm_embedding_cache_size_bytes)
-
-    output_proc = SGLangOutputProcessor(
-        capture_hidden=False,
-        capture_hidden_layers=None,
-        model=model_worker.model_runner.model,
-    )
-    request_builder, result_adapter = make_moss_transcribe_diarize_scheduler_adapters(
-        processor=processor,
-        tokenizer=tokenizer,
-        max_new_tokens=resolved_max_new_tokens,
-    )
-
-    return OmniScheduler(
-        tp_worker=model_worker,
-        tree_cache=tree_cache,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        server_args=server_args,
-        model_config=model_config,
-        prefill_manager=prefill_mgr,
-        decode_manager=decode_mgr,
-        model_runner=ModelRunner(model_worker, output_proc),
-        request_builder=request_builder,
-        result_adapter=result_adapter,
+        mm_embedding_cache_size_bytes=mm_embedding_cache_size_bytes,
+        encoder_cache_size_bytes=encoder_cache_size_bytes,
+        enable_torch_compile=enable_torch_compile,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
+        encoder_chunk_buckets=buckets,
+        encoder_torch_compile=encoder_torch_compile,
+        encoder_max_batch_size=encoder_max_batch_size,
+        prefill_coalesce_requests=prefill_coalesce_requests,
+        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+        prefill_coalesce_when_idle=prefill_coalesce_when_idle,
+        prefill_coalesce_requires_pending_builds=(
+            prefill_coalesce_requires_pending_builds
+        ),
+        prefill_coalesce_after_builds_during_decode=(
+            prefill_coalesce_after_builds_during_decode
+        ),
         request_build_max_workers=request_build_max_workers,
         request_build_max_pending=request_build_max_pending,
+        stream_emit_interval_s=stream_emit_interval_s,
+    ).build(
+        model_path,
+        device=device,
+        dtype=dtype,
+        server_args_overrides=server_args_overrides,
     )
 
 

@@ -24,11 +24,15 @@ from transformers.utils.hub import cached_file
 # ---------------------------------------------------------------------------
 
 _CONFIG_MODEL_TYPE_TO_ARCH = {
+    "fish_qwen3_omni": "FishQwen3OmniForCausalLM",
     "moss_tts_delay": "MossTTSDelayModel",
     "moss_tts_delay_with_codec": "MossTTSDelayWithCodec",
     "moss_tts_local": "MossTTSLocalModel",
+    "dots_tts": "DotsTTSForConditionalGeneration",
     "qwen3_tts": "Qwen3TTSForConditionalGeneration",
     "voxtral_tts": "VoxtralTTSForConditionalGeneration",
+    # ZONOS2 ships params.json (model_type "zonos2") with no config.json.
+    "zonos2": "Zonos2ForCausalLM",
 }
 
 

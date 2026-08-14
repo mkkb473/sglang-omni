@@ -21,7 +21,7 @@ DEPS_HASH_FILE="${OMNI_CI_HOME}/.deps-hash"
 source "${SCRIPT_DIR}/omni_ci_deps_hash.sh"
 DEPS_HASH="$(omni_ci_deps_hash)"
 
-LOCK_DIR="${UV_CACHE_DIR:-/github/home/.cache/uv}"
+LOCK_DIR="${UV_CACHE_DIR:-/data/omni-ci/uv-cache}"
 mkdir -p "${LOCK_DIR}"
 LOCK_FILE="${LOCK_DIR}/omni-venv-prepare-$(echo -n "${OMNI_CI_HOME}" | sha256sum | awk '{print $1}').lock"
 
@@ -35,22 +35,29 @@ echo "Preparing fresh ${HOST} (full rebuild)"
 rm -f "${OMNI_CI_HOME}/.omni-env-complete"
 rm -rf "${OMNI_CI_HOME}"
 mkdir -p "${OMNI_CI_HOME}"
-uv venv "${HOST}" -p 3.11
+uv venv --system-site-packages "${HOST}" -p /usr/bin/python3.12
 
 rm -rf "./${VENV_NAME}"
 ln -sfn "${HOST}" "./${VENV_NAME}"
 source "${VENV_NAME}/bin/activate"
-uv pip install -e .
 
-if ! python -c "import av" 2>/dev/null; then
-  echo "PyAV native libraries corrupted in prepared venv, force-reinstalling..."
-  uv pip install --force-reinstall --no-deps --no-cache av
+mapfile -t MISSING_REQUIREMENTS < <(
+  python "${SCRIPT_DIR}/omni_missing_dependencies.py" pyproject.toml
+)
+if [ "${#MISSING_REQUIREMENTS[@]}" -gt 0 ]; then
+  echo "Installing dependencies missing from the image:"
+  printf '  %s\n' "${MISSING_REQUIREMENTS[@]}"
+  for requirement in "${MISSING_REQUIREMENTS[@]}"; do
+    python -m pip install "${requirement}"
+  done
 fi
-
-if ! python -c "from whisper.normalizers import EnglishTextNormalizer" 2>/dev/null; then
-  echo "openai-whisper missing from prepared venv, installing pinned dependency..."
-  uv pip install --force-reinstall --no-deps --no-cache openai-whisper==20250625
+mapfile -t OVERRIDE_REQUIREMENTS < <(
+  python "${SCRIPT_DIR}/omni_missing_dependencies.py" --overrides pyproject.toml
+)
+if [ "${#OVERRIDE_REQUIREMENTS[@]}" -gt 0 ]; then
+  python -m pip install --no-deps "${OVERRIDE_REQUIREMENTS[@]}"
 fi
+uv pip install --no-deps -e .
 
 if ! bash "${SCRIPT_DIR}/validate_omni_venv_imports.sh" "${VENV_NAME}"; then
   exit 1

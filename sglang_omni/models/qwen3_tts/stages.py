@@ -12,40 +12,32 @@ import torch
 from sglang_omni.models.qwen3_tts.compat import (
     apply_qwen_tts_transformers_compatibility_patches,
 )
-from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.request_builders import (
     cleanup_prepared_qwen3_tts_request,
-    make_qwen3_tts_scheduler_adapters,
     preprocess_qwen3_tts_payload,
-    set_qwen3_tts_preprocessing_context,
 )
-from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.generation_batch_policy import (
-    build_generation_batch_overrides,
-    validate_generation_batch_policy,
+from sglang_omni.models.qwen3_tts.streaming_vocoder import (
+    DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
+    DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
+    DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
+    DEFAULT_QWEN3_TTS_STREAM_STRIDE,
+    Qwen3TTSStreamingVocoderScheduler,
 )
-from sglang_omni.scheduling.pipeline_state import build_usage
-from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state
-from sglang_omni.scheduling.pipeline_state import store_state as _store_pipeline_state
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
-from sglang_omni.utils.audio_payload import audio_waveform_payload
+from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
 
 _QWEN_TTS_INSTALL_HINT = (
-    "Qwen3-TTS support requires the official `qwen-tts` package. "
-    "Install `qwen-tts==0.1.1` and its Transformers 4.57.3 requirement "
-    "in the serving environment before launching Qwen3-TTS."
+    "Qwen3-TTS support requires the official `qwen-tts` package:\n"
+    "    apt-get update && apt-get install -y sox\n"
+    "    uv pip install --no-deps sox einops\n"
+    "    uv pip install --no-deps qwen-tts==0.1.1\n"
+    "`--no-deps` is required on both lines: qwen-tts pins Transformers 4.57.3, "
+    "and resolving sox lifts numpy past the numba==0.65.1 ceiling. See "
+    "docs/cookbook/qwen3_tts.md."
 )
-
-
-def load_state(payload: StagePayload) -> Qwen3TTSState:
-    return _load_pipeline_state(payload, Qwen3TTSState)
-
-
-def store_state(payload: StagePayload, state: Qwen3TTSState) -> StagePayload:
-    return _store_pipeline_state(payload, state)
 
 
 def _load_qwen3_tts_tokenizer(
@@ -116,7 +108,7 @@ def _compile_qwen3_tts_backbone(model: Any) -> None:
     text_model = model.model
     layers = text_model.layers
 
-    from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
+    from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 
     set_torch_compile_config()
     compile_mode = os.environ.get(
@@ -128,24 +120,19 @@ def _compile_qwen3_tts_backbone(model: Any) -> None:
     ]
 
 
-def _audio_to_list(audio: Any) -> list[float]:
-    if isinstance(audio, torch.Tensor):
-        return audio.detach().float().cpu().flatten().tolist()
-    try:
-        import numpy as np
-
-        array = np.asarray(audio, dtype=np.float32).reshape(-1)
-        return array.tolist()
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            f"Unsupported Qwen3-TTS audio output type: {type(audio)}"
-        ) from exc
-
-
-def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
+def create_preprocessing_executor(
+    model_path: str,
+    *,
+    max_concurrency: int = 8,
+) -> ThreadedSimpleScheduler:
     del model_path
-    return SimpleScheduler(
+    # note (luojiaxuan): preprocessing must admit several requests at once. A
+    # serial executor keeps at most one reference-code request in flight, so
+    # the speech-tokenizer batcher would only ever see batches of one; the
+    # default matches the batcher's max_batch_size.
+    return ThreadedSimpleScheduler(
         preprocess_qwen3_tts_payload,
+        max_concurrency=max_concurrency,
         abort_callback=cleanup_prepared_qwen3_tts_request,
     )
 
@@ -159,115 +146,20 @@ def create_sglang_tts_engine_executor(
     attn_implementation: str | None = None,
     server_args_overrides: dict[str, Any] | None = None,
 ) -> Any:
-    apply_qwen_tts_transformers_compatibility_patches()
-    from qwen_tts import Qwen3TTSModel
-    from transformers import AutoProcessor
+    from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 
-    from sglang_omni.models.qwen3_tts.model_runner import Qwen3TTSModelRunner
-    from sglang_omni.scheduling.bootstrap import (
-        create_sglang_infrastructure_defer_cuda_graph,
-    )
-    from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-    from sglang_omni.scheduling.sglang_backend import (
-        SGLangOutputProcessor,
-        build_sglang_server_args,
-    )
-
-    _register_qwen3_tts_hf_config()
-    checkpoint_dir = _resolve_checkpoint(model_path)
-    if gpu_id is not None:
-        device = f"cuda:{gpu_id}"
-    gpu_id = int(device.split(":")[-1]) if ":" in device else 0
-
-    overrides = build_generation_batch_overrides(
-        max_running_requests=16,
-        cuda_graph_max_bs=32,
-        torch_compile_max_bs=32,
-        server_args_overrides=server_args_overrides,
-        dtype=dtype,
-        disable_cuda_graph=False,
-        disable_overlap_schedule=True,
-        enable_torch_compile=True,
-        mem_fraction_static=0.85,
-        max_prefill_tokens=8192,
-        sampling_backend="pytorch",
-        trust_remote_code=True,
-    )
-
-    server_args = build_sglang_server_args(
-        checkpoint_dir,
-        context_length=8192,
-        **overrides,
-    )
-
-    want_cuda_graph, (
-        model_worker,
-        tree_cache,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        prefill_mgr,
-        decode_mgr,
-        model_config,
-    ) = create_sglang_infrastructure_defer_cuda_graph(
-        server_args,
-        gpu_id,
-        model_arch_override="Qwen3TTSTalker",
-    )
-
-    validate_generation_batch_policy(
-        model_name="Qwen3-TTS",
-        server_args=server_args,
-    )
-
-    model = model_worker.model_runner.model
-    speech_tokenizer = _load_qwen3_tts_tokenizer(
-        checkpoint_dir,
-        device=device,
-        dtype=dtype,
+    return Qwen3TtsEngineBuilder(
         attn_implementation=attn_implementation,
-    )
-    model.load_speech_tokenizer(speech_tokenizer)
-    processor = AutoProcessor.from_pretrained(checkpoint_dir, fix_mistral_regex=True)
-    wrapper = Qwen3TTSModel(
-        model=model,
-        processor=processor,
-        generate_defaults=_load_qwen3_tts_generate_defaults(checkpoint_dir),
-    )
-    set_qwen3_tts_preprocessing_context(model=model, wrapper=wrapper)
-    if bool(server_args.enable_torch_compile):
-        _compile_qwen3_tts_backbone(model)
-        server_args.enable_torch_compile = False
-    if want_cuda_graph:
-        model_worker.model_runner.init_device_graphs()
-
-    output_proc = SGLangOutputProcessor(
-        capture_hidden=False,
-        capture_hidden_layers=None,
-        model=model,
-    )
-    request_builder, result_adapter = make_qwen3_tts_scheduler_adapters(
-        model=model,
-        wrapper=wrapper,
-    )
-
-    return OmniScheduler(
-        tp_worker=model_worker,
-        tree_cache=tree_cache,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        server_args=server_args,
-        model_config=model_config,
-        prefill_manager=prefill_mgr,
-        decode_manager=decode_mgr,
-        model_runner=Qwen3TTSModelRunner(model_worker, output_proc),
-        request_builder=request_builder,
-        result_adapter=result_adapter,
-        abort_callback=cleanup_prepared_qwen3_tts_request,
+    ).build(
+        model_path,
+        device=device,
+        gpu_id=gpu_id,
+        dtype=dtype,
+        server_args_overrides=server_args_overrides,
     )
 
 
-def create_tts_engine_executor(*args, **kwargs) -> Any:
-    return create_sglang_tts_engine_executor(*args, **kwargs)
+create_tts_engine_executor = create_sglang_tts_engine_executor
 
 
 def create_vocoder_executor(
@@ -279,6 +171,16 @@ def create_vocoder_executor(
     attn_implementation: str | None = None,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
+    stream_stride: int = DEFAULT_QWEN3_TTS_STREAM_STRIDE,
+    stream_followup_stride: int = DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
+    stream_initial_followup_stride: int | None = None,
+    initial_chunk_frames: int = DEFAULT_QWEN3_TTS_INITIAL_CHUNK_FRAMES,
+    stream_left_context_frames: int = DEFAULT_QWEN3_TTS_LEFT_CONTEXT_FRAMES,
+    initial_max_batch_size: int = 32,
+    initial_batch_wait_ms: int = 2,
+    followup_max_batch_size: int = 8,
+    followup_batch_wait_ms: int = 1,
+    initial_cuda_graph: bool = True,
 ) -> SimpleScheduler:
     if gpu_id is not None:
         device = f"cuda:{gpu_id}"
@@ -289,67 +191,19 @@ def create_vocoder_executor(
         attn_implementation=attn_implementation,
     )
 
-    def _prepare_vocoder_item(
-        payload: StagePayload,
-    ) -> tuple[Qwen3TTSState, torch.Tensor]:
-        state = load_state(payload)
-        if state.audio_codes is None:
-            raise RuntimeError("Qwen3-TTS vocoder requires audio_codes from tts_engine")
-
-        codes = torch.as_tensor(state.audio_codes, dtype=torch.long)
-        return state, codes
-
-    def _store_vocoder_result(
-        payload: StagePayload,
-        state: Qwen3TTSState,
-        codes: torch.Tensor,
-        wav: Any,
-        sample_rate: int,
-    ) -> StagePayload:
-        if wav is None:
-            raise RuntimeError("Qwen3-TTS speech tokenizer did not return audio")
-
-        if state.ref_code_len:
-            total_len = int(codes.shape[0])
-            cut = int(state.ref_code_len / max(total_len, 1) * wav.shape[0])
-            wav = wav[cut:]
-        audio_payload = audio_waveform_payload(wav, source_hint="Qwen3-TTS")
-        state.audio_samples = None
-        state.sample_rate = int(sample_rate)
-        state.audio_codes = None
-
-        payload = store_state(payload, state)
-        payload.data.update(audio_payload)
-        payload.data["sample_rate"] = state.sample_rate
-        payload.data["modality"] = "audio"
-        usage = build_usage(state)
-        if usage is not None:
-            payload.data["usage"] = usage
-        return payload
-
-    def _vocode(payload: StagePayload) -> StagePayload:
-        state, codes = _prepare_vocoder_item(payload)
-        wavs, sample_rate = tokenizer.decode([{"audio_codes": codes}])
-        wav = wavs[0] if wavs else None
-        return _store_vocoder_result(payload, state, codes, wav, sample_rate)
-
-    def _vocode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
-        items = [_prepare_vocoder_item(payload) for payload in payloads]
-        wavs, sample_rate = tokenizer.decode(
-            [{"audio_codes": codes} for _, codes in items]
-        )
-        if len(wavs) != len(items):
-            raise RuntimeError(
-                f"Qwen3-TTS speech tokenizer returned {len(wavs)} audios for {len(items)} requests"
-            )
-        return [
-            _store_vocoder_result(payload, state, codes, wav, sample_rate)
-            for payload, (state, codes), wav in zip(payloads, items, wavs)
-        ]
-
-    return SimpleScheduler(
-        _vocode,
-        batch_compute_fn=_vocode_batch,
+    return Qwen3TTSStreamingVocoderScheduler(
+        tokenizer,
+        device=device,
+        stream_stride=stream_stride,
+        stream_followup_stride=stream_followup_stride,
+        stream_initial_followup_stride=stream_initial_followup_stride,
+        initial_chunk_frames=initial_chunk_frames,
+        stream_left_context_frames=stream_left_context_frames,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        initial_max_batch_size=initial_max_batch_size,
+        initial_batch_wait_ms=initial_batch_wait_ms,
+        followup_max_batch_size=followup_max_batch_size,
+        followup_batch_wait_ms=followup_batch_wait_ms,
+        initial_cuda_graph=initial_cuda_graph,
     )

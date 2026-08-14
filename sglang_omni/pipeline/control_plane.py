@@ -13,7 +13,10 @@ from sglang_omni.proto import (
     AdminMessage,
     AdminResultMessage,
     CompleteMessage,
+    DataAckMessage,
     DataReadyMessage,
+    KVTransferPrepareMessage,
+    KVTransferReadyMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
     ShutdownMessage,
@@ -27,7 +30,10 @@ logger = logging.getLogger(__name__)
 ControlMessage = (
     AdminMessage
     | AdminResultMessage
+    | DataAckMessage
     | DataReadyMessage
+    | KVTransferPrepareMessage
+    | KVTransferReadyMessage
     | AbortMessage
     | CompleteMessage
     | StreamMessage
@@ -97,6 +103,19 @@ class PushSocket:
         if self._socket is not None:
             self._socket.close()
             self._socket = None
+
+
+async def send_to_endpoint(
+    sockets: dict[str, PushSocket],
+    endpoint: str,
+    msg: ControlMessage,
+) -> None:
+    socket = sockets.get(endpoint)
+    if socket is None:
+        socket = PushSocket(endpoint)
+        await socket.connect()
+        sockets[endpoint] = socket
+    await socket.send(msg)
 
 
 class PullSocket:
@@ -261,6 +280,7 @@ class StageControlPlane:
         self,
     ) -> (
         AdminMessage
+        | DataAckMessage
         | DataReadyMessage
         | SubmitMessage
         | ShutdownMessage
@@ -275,6 +295,7 @@ class StageControlPlane:
             msg,
             (
                 DataReadyMessage,
+                DataAckMessage,
                 SubmitMessage,
                 ShutdownMessage,
                 ProfilerStartMessage,
@@ -286,15 +307,13 @@ class StageControlPlane:
         raise ValueError(f"Unexpected message type: {type(msg)}")
 
     async def send_to_stage(
-        self, next_stage: str, next_stage_endpoint: str, msg: DataReadyMessage
+        self,
+        next_stage: str,
+        next_stage_endpoint: str,
+        msg: DataReadyMessage | DataAckMessage,
     ) -> None:
-        """Send data ready notification to next stage."""
-        if next_stage not in self._next_stage_sockets:
-            sock = PushSocket(next_stage_endpoint)
-            await sock.connect()
-            self._next_stage_sockets[next_stage] = sock
-
-        await self._next_stage_sockets[next_stage].send(msg)
+        """Send a stage-to-stage control message."""
+        await send_to_endpoint(self._next_stage_sockets, next_stage_endpoint, msg)
 
     async def send_complete(self, msg: CompleteMessage) -> None:
         """Send completion notification to coordinator."""

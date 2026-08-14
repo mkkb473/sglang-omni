@@ -3,21 +3,28 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class RelayConfig(BaseModel):
-    """Relay configuration for stage data transfer."""
+class CommConfig(BaseModel):
+    """Per-stage communication buffer and Mooncake options.
+
+    Transport selection is owned by ``CommRouter`` from stage locality and
+    placement. This config only tunes buffer pools and backend-specific
+    connection options for transports the router selects.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     slot_size_mb: int = 512
     credits: int = 2
-    rank: int | None = None
-    world_size: int | None = None
-    device: str = "cpu"
+    cuda_ipc_slot_size_kb: int = 64
+    cuda_ipc_pool_size_mb: int | None = None
+    mooncake_protocol: str = "rdma"
+    mooncake_hostname: str | None = None
+    mooncake_device_name: str = ""
 
 
 class EndpointsConfig(BaseModel):
@@ -41,16 +48,17 @@ class ParallelismConfig(BaseModel):
 
 
 class StageResourceConfig(BaseModel):
-    """Placement-resource intent for one stage rank/process."""
+    """Placement-resource intent for one logical stage rank."""
 
     model_config = ConfigDict(extra="forbid")
 
     total_gpu_memory_fraction: float | None = Field(
         default=None,
         description=(
-            "Per-rank/process budget as a fraction of total physical GPU "
-            "memory. After TP expansion, each rank contributes this budget to "
-            "its assigned GPU."
+            "Per-stage-rank budget as a fraction of total physical GPU memory. "
+            "After TP expansion, each rank contributes this budget to its "
+            "assigned GPU; stages sharing an OS process contribute jointly to "
+            "that process's budget."
         ),
     )
 
@@ -158,6 +166,9 @@ class StageConfig(BaseModel):
     # --- Runtime intent ---
     runtime: StageRuntimeConfig = Field(default_factory=StageRuntimeConfig)
     runtime_arg_map: dict[str, str] = Field(default_factory=dict)
+    # Note (Yueying Li): per-stage env defaults applied in this stage's worker process at spawn
+    # (merged over the pipeline-level env_defaults; never overrides os.environ).
+    env: dict[str, str] = Field(default_factory=dict)
 
     # --- Fan-in ---
     wait_for: list[str] | None = None
@@ -169,11 +180,14 @@ class StageConfig(BaseModel):
     stream_done_to_fn: str | None = None
     can_accept_stream_before_payload: bool = False
 
+    # --- Payload transport ---
+    disable_direct_cuda_ipc_payload: bool = False
+
     # --- Route-specific payload projection ---
     project_payload: dict[str, str] = Field(default_factory=dict)
 
-    # --- Relay (auto-inferred from gpu when None) ---
-    relay: RelayConfig | None = None
+    # --- Communication pool tuning ---
+    comm: CommConfig | None = None
 
     def model_post_init(self, __context: Any = None) -> None:
         fields_set = self.__pydantic_fields_set__
@@ -198,20 +212,93 @@ class StageConfig(BaseModel):
             self.tp_size = self.parallelism.tp
 
 
+class AudioChunkingConfig(BaseModel):
+    """Per-model long-audio policy for the transcription endpoint.
+
+    Each ASR model declares the longest clip it can take in one request; anything
+    longer gets split into non-overlapping chunks that are transcribed
+    independently.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # Some models can't correctly transcribe an isolated chunk (e.g. diarization needs to track speakers across the whole
+    # recording), so we leave the default value of `allow_audio_chunking` = False.
+    allow_audio_chunking: bool = False
+    # Note (Jeffro): Longest clip (chunk length) sent to the engine in one request.
+    # Must stay within what the model's context can hold (Qwen3-ASR sizes its
+    # context for the official 1,200s native limit); below that ceiling it
+    # is a scheduling trade-off: shorter chunks batch better and keep a
+    # long upload from monopolizing the engine, at the cost of more seams.
+    max_audio_clip_s: float = Field(default=60.0, gt=0)
+
+    max_native_clip_s: float | None = Field(default=None, gt=0)
+
+    max_total_audio_s: float | None = Field(default=3600.0, gt=0)
+
+    # Shortest final chunk worth transcribing.
+    min_tail_s: float = Field(default=0.5, ge=0)
+
+    # Note (Jeffro): How many chunks of one HTTP request may run in the engine at once.
+    # This is a fairness cap: to avoid a single long
+    # upload grabs every batch slot and queues out everyone else's requests.
+    # This is a pre-request cap.
+    max_concurrent_chunks: int = Field(default=8, ge=1)
+
+    def model_post_init(self, __context: Any = None) -> None:
+        if (
+            self.max_total_audio_s is not None
+            and self.max_total_audio_s < self.max_audio_clip_s
+        ):
+            raise ValueError(
+                f"max_total_audio_s={self.max_total_audio_s} must be at least "
+                f"max_audio_clip_s={self.max_audio_clip_s}"
+            )
+        if (
+            self.max_native_clip_s is not None
+            and self.max_native_clip_s < self.max_audio_clip_s
+        ):
+            raise ValueError(
+                f"max_native_clip_s={self.max_native_clip_s} must be at least "
+                f"max_audio_clip_s={self.max_audio_clip_s}"
+            )
+
+    @property
+    def stream_clip_limit_s(self) -> float:
+        """Longest clip the un-chunkable streaming path accepts."""
+        return (
+            self.max_native_clip_s
+            if self.max_native_clip_s is not None
+            else self.max_audio_clip_s
+        )
+
+    def chunk_samples(self, sample_rate: int) -> int:
+        """Chunk length in samples, at least one sample."""
+        return max(int(self.max_audio_clip_s * sample_rate), 1)
+
+
 class PipelineConfig(BaseModel):
-    """Top-level pipeline configuration."""
+    """Top-level pipeline configuration.
+
+    Subclasses set ``requires_model_capabilities`` when their model package
+    must export static architecture-level capability metadata.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     architecture: ClassVar[str | None] = None
     architecture_aliases: ClassVar[tuple[str, ...]] = ()
+    requires_model_capabilities: ClassVar[bool] = False
     tensor_parallel_disable_custom_all_reduce_stages: ClassVar[tuple[str, ...]] = ()
+    required_speech_reference_count: ClassVar[int | None] = None
+    speech_reference_text_required: ClassVar[bool] = False
+    additional_speech_languages: ClassVar[frozenset[str]] = frozenset()
+    audio_chunking: ClassVar[AudioChunkingConfig] = AudioChunkingConfig()
 
     model_path: str
     stages: list[StageConfig]
     name: str | None = None
     entry_stage: str | None = None
-    relay_backend: Literal["shm", "nccl", "nixl", "mooncake"] = "shm"
     fused_stages: list[list[str]] = Field(default_factory=list)
     runtime_overrides: dict[str, dict[str, Any]] = Field(default_factory=dict)
     env_defaults: dict[str, str] = Field(default_factory=dict)
@@ -237,6 +324,38 @@ class PipelineConfig(BaseModel):
     @property
     def terminal_stages(self) -> list[str]:
         return [s.name for s in self.stages if s.terminal]
+
+    @classmethod
+    def isolation_role_to_stage(cls) -> dict[str, str]:
+        """Map public isolation roles to model-specific stage names."""
+        return {}
+
+    @classmethod
+    def process_safe_edges(cls) -> frozenset[tuple[str, str]]:
+        """Pipeline edges that stay correct once they become cross-process.
+
+        Keyed by edge rather than by stage because correctness depends on which
+        handoff crosses a process boundary, not on which stage moved. Grouping
+        ``preprocessing`` with ``audio_encoder`` leaves their shared handoff
+        local and only crosses ``audio_encoder -> tts_engine``.
+
+        An edge is safe when the downstream stage rebuilds everything it needs
+        from the payload rather than from a process-local registry. Independent
+        of whether the split also needs GPU memory fractions.
+        """
+        return frozenset()
+
+    @classmethod
+    def process_edge_resources(
+        cls,
+    ) -> dict[tuple[str, str], dict[str, float]]:
+        """Map newly crossed pipeline edges to GPU memory fractions.
+
+        Only a placement recommendation applied when an override makes the
+        edge cross processes. An edge absent here is still splittable when the
+        config already declares fractions, or when nothing else shares its GPU.
+        """
+        return {}
 
     @classmethod
     def mem_fraction_role_to_stage(cls) -> dict[str, str]:

@@ -13,17 +13,41 @@ endpoint.
 Install `sglang-omni` by following [Installation](../get_started/installation.md).
 
 Qwen3-TTS Base uses the upstream `qwen-tts` package. Install it without
-dependencies so the SGLang-Omni Transformers 5.6 / SGLang 0.5.12.post1 stack remains
+dependencies so the SGLang-Omni Transformers 5.12 / SGLang 0.5.16 stack remains
 in place:
 
 ```bash
 apt-get update && apt-get install -y sox
-uv pip install sox einops onnxruntime
+uv pip install --no-deps sox einops
 uv pip install --no-deps qwen-tts==0.1.1
 ```
 
+`--no-deps` is required on **both** lines, for two different reasons.
+
+`qwen-tts` pins Transformers 4.57.3, which would replace the project's 5.12.1.
+And resolving `sox` normally pulls `numpy` past the ceiling `numba==0.65.1`
+imposes (numba requires `numpy<=2.4`); the upgraded `numpy` then breaks
+`librosa`, so `import qwen_tts` fails with `Numba needs NumPy 2.4 or less`
+before the server can start.
+
+Do not add `onnxruntime` to that line either — it is already a SGLang-Omni
+dependency, and resolving it pulls `numpy` the same way.
+
 > Do **not** install `qwen-tts` with dependencies here. Its declared dependency
 > set can pull a different Transformers/Torch stack than the SGLang-Omni runtime.
+
+Concretely, `qwen-tts` 0.1.1 pins Transformers 4.57.3, and its model code calls
+APIs that Transformers 5.12 has since renamed or removed — most visibly the mask
+factories (`create_causal_mask` and friends), which now spell `input_embeds` as
+`inputs_embeds` and no longer accept `cache_position`. SGLang-Omni patches these
+differences in
+`sglang_omni/models/qwen3_tts/compat.py`, which every Qwen3-TTS entry point
+applies before importing `qwen_tts`. The pinned Transformers 5.12 / SGLang 0.5.16
+stack is therefore the supported configuration, not a workaround.
+
+If you hit a `TypeError` raised from inside `qwen_tts`, do not resolve it by
+installing the package's own Transformers pin — that breaks the rest of the
+runtime. Report it instead, so the shim can cover it.
 
 The Python `sox` package shells out to the system `sox` binary on some paths, so install both.
 
@@ -72,6 +96,8 @@ mode.
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
+    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "voice": "default",
     "input": "SGLang-Omni is a great project!",
     "references": [{
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
@@ -92,6 +118,8 @@ import requests
 resp = requests.post(
     "http://localhost:8000/v1/audio/speech",
     json={
+        "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "voice": "default",
         "input": "Get the trust fund to the bank early.",
         "references": [{
             "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
@@ -104,6 +132,11 @@ with open("output.wav", "wb") as f:
     f.write(resp.content)
 ```
 
+Non-streaming responses include `X-Finish-Reason: stop` after codec EOS or
+`X-Finish-Reason: length` when generation reaches `max_new_tokens`. A `length`
+response still contains decodable audio, but the utterance may be incomplete.
+Batch responses expose the same value as each item's `finish_reason`.
+
 ### Language Hint
 
 `language` biases the model toward a target language. It defaults to `auto` (let the model
@@ -114,6 +147,8 @@ Portuguese, Spanish, and Italian.
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
+    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "voice": "default",
     "input": "今天天气不错，就该出去晒晒太阳。",
     "references": [{
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
@@ -133,6 +168,8 @@ chunks in real time:
 curl -N -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
+    "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "voice": "default",
     "input": "Get the trust fund to the bank early.",
     "references": [{
       "audio_path": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
@@ -148,12 +185,19 @@ Streaming returns `audio/pcm` 16-bit mono PCM bytes with sample-rate metadata in
 the response headers. See the [Higgs TTS cookbook](../cookbook/higgs_tts.md#streaming)
 for a full Python raw PCM consumer.
 
+Base/reference-cloning checkpoints use true incremental codec and vocoder
+streaming for both this HTTP endpoint and `/v1/audio/speech/stream` WebSocket
+sessions with `stream_audio=true`. CustomVoice and VoiceDesign remain
+non-streaming.
+
 ## Generation Parameters
 
 | Parameter | Default | Notes |
 |---|---|---|
+| `model` | served model | Served model identifier |
 | `input` | (required) | Text to synthesize |
-| `references` | `null` | Reference clip for cloning; each item has `audio_path` and `text` |
+| `voice` | `default` | Voice identifier. For Base reference cloning, the reference clip provides the speaker conditioning |
+| `references` | `null` | Reference clip for cloning. Each item has `audio_path` and `text` |
 | `ref_audio` / `ref_text` | `null` | Shorthand for `references[0].audio_path` / `references[0].text` |
 | `language` | `auto` | Target-language hint (see list above) |
 | `temperature` | `0.9` | Sampling temperature |

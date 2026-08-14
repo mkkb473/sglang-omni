@@ -1,26 +1,46 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import base64
+import logging
 import queue
+import threading
 from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
+import typer
 
+from sglang_omni.cli.serve import apply_mem_fraction_cli_overrides
+from sglang_omni.config.runtime import resolve_stage_static_factory_args
+from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.higgs_tts import stages
+from sglang_omni.models.higgs_tts import utils as higgs_utils
 from sglang_omni.models.higgs_tts.config import HiggsTtsPipelineConfig
+from sglang_omni.models.higgs_tts.model import HiggsTTSModel
 from sglang_omni.models.higgs_tts.model_runner import HiggsTTSModelRunner
 from sglang_omni.models.higgs_tts.payload_types import HiggsTtsState
 from sglang_omni.models.higgs_tts.request_builders import build_higgs_stream_metadata
-from sglang_omni.models.higgs_tts.sampler import K_MAX
+from sglang_omni.models.higgs_tts.sampler import (
+    K_MAX,
+    NO_SEED,
+    HiggsBatchedSamplerState,
+)
+from sglang_omni.models.higgs_tts.text_tokenizer import AUDIO_PLACEHOLDER_ID
 from sglang_omni.models.higgs_tts.utils import EOC_ID, apply_delay_pattern
 from sglang_omni.models.higgs_tts.vocoder_scheduler import (
+    DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
+    DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+    DEFAULT_HIGGS_STREAM_STRIDE,
+    HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA,
+    HIGGS_STREAM_STRIDE_METADATA,
     HiggsStreamingVocoderScheduler,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.speaker_cache import get_speaker_artifact_cache
+from tests.unit_test.fakes import FakeServerArgs
 
 
 def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
@@ -29,20 +49,242 @@ def test_higgs_streaming_pipeline_routes_chunks_to_vocoder() -> None:
 
     assert stages_by_name["tts_engine"].stream_to == ["vocoder"]
     assert "server_args_overrides" not in stages_by_name["tts_engine"].factory_args
+    assert stages_by_name["vocoder"].process == "pipeline"
+    assert stages_by_name["vocoder"].factory_args["compile_decode"] is False
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
 
-def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
+def test_higgs_sampler_pool_rows_default_to_unseeded() -> None:
+    pool = HiggsBatchedSamplerState(max_batch_size=4, num_codebooks=2, device="cpu")
+
+    assert bool((pool.seeds == NO_SEED).all())
+
+    pool.seeds[1] = 42  # a stale concrete seed must not survive a row reset
+    pool.reset_row(1)
+
+    assert int(pool.seeds[1].item()) == NO_SEED
+
+
+def test_higgs_vocoder_rejects_compile_and_graph_domain_together() -> None:
+    # Pure-argument contract check, so it must fail before any checkpoint
+    # access rather than after weights have already been loaded.
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        stages.create_vocoder_executor(
+            "unused-model-path",
+            compile_decode=True,
+            decode_cuda_graph_frame_counts=(1, 2),
+        )
+
+
+def test_higgs_request_row_seed_tracks_request_seed() -> None:
+    model = object.__new__(HiggsTTSModel)
+    model._rid_to_row = {}
+    model._free_rows = [0]
+    model._sampler_pool = SimpleNamespace(
+        seeds=torch.full((1,), 7, dtype=torch.long),
+        reset_row=lambda row: None,
+    )
+
+    # Unseeded request: the row keeps the unseeded sentinel and stays on
+    # the true torch.multinomial path.
+    model.set_request_seed("request", None)
+    assert model._rid_to_row == {"request": 0}
+    assert int(model._sampler_pool.seeds[0].item()) == NO_SEED
+
+    # Seeded request on the same row: the masked public seed lands.
+    model.set_request_seed("request", 42)
+    assert model._sampler_pool.seeds[0].item() == 42
+
+
+def test_higgs_prefill_embeddings_attach_private_sidecar() -> None:
+    seeds: list[tuple[str, int | None]] = []
+    model = SimpleNamespace(
+        set_request_seed=lambda request_id, seed: seeds.append((request_id, seed)),
+    )
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = model
+    raw_embeds = torch.arange(134 * 4, dtype=torch.float32).view(134, 4)
+    runner._build_prefill_input_embeds = lambda _forward_batch, _requests: raw_embeds
+    request = SimpleNamespace(
+        request_id="request",
+        data=SimpleNamespace(
+            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=17))
+        ),
+    )
+    forward_batch = SimpleNamespace(
+        input_embeds=None,
+        replace_embeds=None,
+        mm_inputs=[None],
+        input_ids=torch.zeros(134, dtype=torch.long),
+        batch_size=1,
+    )
+
+    runner.before_prefill(forward_batch, None, [request])
+
+    payload = get_omni_prefill_inputs(forward_batch)
+    assert forward_batch.input_embeds is None
+    assert forward_batch.mm_inputs == [None]
+    assert payload is not None
+    assert payload.input_embeds.shape == (134, 4)
+    torch.testing.assert_close(payload.input_embeds, raw_embeds)
+    assert seeds == [("request", 17)]
+
+
+def test_higgs_prefill_embeddings_follow_radix_prefix_position() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner.model = SimpleNamespace(
+        backbone=SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=lambda ids: torch.stack(
+                    (ids.to(torch.float32), ids.to(torch.float32)), dim=-1
+                )
+            )
+        ),
+        multimodal_embedding=SimpleNamespace(
+            modality_embedding_0=lambda codes: codes.to(torch.float32)
+        ),
+    )
+    origin_input_ids = [
+        7,
+        AUDIO_PLACEHOLDER_ID,
+        AUDIO_PLACEHOLDER_ID,
+        AUDIO_PLACEHOLDER_ID,
+        8,
+    ]
+    request = SimpleNamespace(
+        data=SimpleNamespace(
+            req=SimpleNamespace(
+                origin_input_ids=origin_input_ids,
+                extend_range=SimpleNamespace(start=2, length=2),
+            ),
+            reference_codes_delayed=[[10, 11], [20, 21], [30, 31]],
+        )
+    )
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor(
+            [AUDIO_PLACEHOLDER_ID, AUDIO_PLACEHOLDER_ID], dtype=torch.long
+        )
+    )
+
+    embeds = runner._build_prefill_input_embeds(forward_batch, [request])
+
+    assert embeds.tolist() == [[20.0, 21.0], [30.0, 31.0]]
+
+
+def test_higgs_streaming_pipeline_shares_vocoder_stride_with_tts_engine() -> None:
+    raw_config = HiggsTtsPipelineConfig(model_path="fake-model").model_dump()
+    vocoder = next(
+        stage for stage in raw_config["stages"] if stage["name"] == "vocoder"
+    )
+    vocoder["factory_args"].update(
+        stream_stride=3,
+        stream_followup_stride=2,
+        initial_chunk_frames=1,
+    )
+
+    config = HiggsTtsPipelineConfig.model_validate(raw_config)
+    stages_by_name = {stage.name: stage for stage in config.stages}
+
+    assert stages_by_name["tts_engine"].factory_args["stream_stride"] == 3
+    assert stages_by_name["tts_engine"].factory_args["stream_followup_stride"] == 2
+    assert stages_by_name["tts_engine"].factory_args["initial_chunk_frames"] == 1
+
+
+def test_higgs_streaming_pipeline_shares_vocoder_runtime_stride_override() -> None:
+    config = HiggsTtsPipelineConfig(
+        model_path="fake-model",
+        runtime_overrides={
+            "vocoder": {
+                "stream_stride": 16,
+                "stream_followup_stride": 7,
+                "initial_chunk_frames": 0,
+            }
+        },
+    )
+    stages_by_name = {stage.name: stage for stage in config.stages}
+
+    tts_engine_args = resolve_stage_static_factory_args(
+        stages_by_name["tts_engine"], config
+    )
+    vocoder_args = resolve_stage_static_factory_args(stages_by_name["vocoder"], config)
+
+    assert tts_engine_args["stream_stride"] == vocoder_args["stream_stride"] == 16
+    assert (
+        tts_engine_args["stream_followup_stride"]
+        == vocoder_args["stream_followup_stride"]
+        == 7
+    )
+    assert (
+        tts_engine_args["initial_chunk_frames"]
+        == vocoder_args["initial_chunk_frames"]
+        == 0
+    )
+
+
+def test_higgs_streaming_pipeline_rejects_conflicting_runtime_stride() -> None:
+    with pytest.raises(ValueError, match="must match between"):
+        HiggsTtsPipelineConfig(
+            model_path="fake-model",
+            runtime_overrides={
+                "tts_engine": {"stream_stride": 8},
+                "vocoder": {"stream_stride": 16},
+            },
+        )
+
+
+def _install_higgs_engine_build_fakes(monkeypatch) -> dict[str, object]:
+    from sglang_omni.models.higgs_tts import model_runner as model_runner_mod
+    from sglang_omni.models.higgs_tts import request_builders
+    from sglang_omni.scheduling import (
+        bootstrap,
+        engine_factory,
+        omni_scheduler,
+        sglang_backend,
+    )
+    from sglang_omni.utils import cuda_graph_batch_validator
+
     captured: dict[str, object] = {}
+    records = {
+        "captured": captured,
+        "infrastructure_saw_graph_disabled": [],
+        "init_graph_calls": [],
+        "attest_calls": [],
+    }
 
     def fake_build_sglang_server_args(checkpoint_dir, context_length, **overrides):
-        server_args = SimpleNamespace(
+        prefill_bs = overrides.get("cuda_graph_bs_prefill")
+        locked = set()
+        if prefill_bs:
+            locked.add(("prefill", "bs"))
+        if "cuda_graph_backend_prefill" in overrides:
+            locked.add(("prefill", "backend"))
+        server_args = FakeServerArgs(
             disable_cuda_graph=overrides["disable_cuda_graph"],
             disable_overlap_schedule=False,
             enable_torch_compile=False,
             max_running_requests=overrides["max_running_requests"],
             cuda_graph_max_bs=overrides["cuda_graph_max_bs"],
             cuda_graph_bs=overrides["cuda_graph_bs"],
+            chunked_prefill_size=overrides.get("chunked_prefill_size"),
+            max_prefill_tokens=overrides.get("max_prefill_tokens", 16384),
+            tp_size=1,
+            attn_cp_size=1,
+            dcp_size=1,
+            lora_paths=None,
+            enable_lora=None,
+            moe_a2a_backend="none",
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(
+                    max_bs=overrides["cuda_graph_max_bs"],
+                    bs=overrides["cuda_graph_bs"],
+                ),
+                prefill=SimpleNamespace(
+                    backend=overrides.get("cuda_graph_backend_prefill", "disabled"),
+                    bs=prefill_bs,
+                    max_bs=overrides.get("cuda_graph_max_bs_prefill"),
+                ),
+            ),
+            _cuda_graph_config_locked=locked,
             torch_compile_max_bs=32,
         )
         captured["checkpoint_dir"] = checkpoint_dir
@@ -51,14 +293,31 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
         captured["server_args"] = server_args
         return server_args
 
-    def fake_create_sglang_infrastructure(server_args, gpu_id):
+    def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
         captured["gpu_id"] = gpu_id
+        captured["infra_kwargs"] = dict(kwargs)
+        records["infrastructure_saw_graph_disabled"].append(
+            bool(server_args.disable_cuda_graph)
+        )
         model = SimpleNamespace(
+            backbone=SimpleNamespace(),
             sampler_pool_max_running_requests=64,
             reset_request=lambda _request_id: None,
         )
+        model_runner = SimpleNamespace(model=model)
+
+        def init_cuda_graphs() -> None:
+            records["init_graph_calls"].append(True)
+
+        model_runner.init_cuda_graphs = init_cuda_graphs
         return (
-            SimpleNamespace(model_runner=SimpleNamespace(model=model)),
+            SimpleNamespace(
+                model_runner=model_runner,
+                model_config=SimpleNamespace(is_multimodal=False),
+                enable_prefill_input_embeds=bool(
+                    kwargs.get("enable_prefill_input_embeds")
+                ),
+            ),
             object(),
             object(),
             object(),
@@ -84,32 +343,50 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
             captured["scheduler_kwargs"] = kwargs
             self.outbox = object()
 
-    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
     monkeypatch.setattr(
-        stages, "build_sglang_server_args", fake_build_sglang_server_args
+        engine_factory, "_resolve_checkpoint", lambda model_path: model_path
     )
     monkeypatch.setattr(
-        stages, "create_sglang_infrastructure", fake_create_sglang_infrastructure
+        sglang_backend, "build_sglang_server_args", fake_build_sglang_server_args
     )
-    monkeypatch.setattr(stages, "truncate_rope_to_bf16", lambda model: None)
-    monkeypatch.setattr(stages, "SGLangOutputProcessor", FakeOutputProcessor)
-    monkeypatch.setattr(stages, "HiggsTTSModelRunner", FakeModelRunner)
+    monkeypatch.setattr(
+        bootstrap, "create_sglang_infrastructure", fake_create_sglang_infrastructure
+    )
+    monkeypatch.setattr(higgs_utils, "truncate_rope_to_bf16", lambda model: None)
+    monkeypatch.setattr(sglang_backend, "SGLangOutputProcessor", FakeOutputProcessor)
+    monkeypatch.setattr(model_runner_mod, "HiggsTTSModelRunner", FakeModelRunner)
+    monkeypatch.setattr(
+        cuda_graph_batch_validator,
+        "attest_prefill_cuda_graphs",
+        lambda model_runner, server_args: records["attest_calls"].append(
+            (model_runner, server_args)
+        ),
+    )
 
-    def fake_make_adapters(model, **kwargs):
+    def fake_make_adapters(**kwargs):
         captured["adapter_kwargs"] = kwargs
         return None, None
 
-    monkeypatch.setattr(stages, "make_higgs_scheduler_adapters", fake_make_adapters)
-    monkeypatch.setattr(stages, "OmniScheduler", FakeScheduler)
+    monkeypatch.setattr(
+        request_builders, "make_higgs_scheduler_adapters", fake_make_adapters
+    )
+    monkeypatch.setattr(omni_scheduler, "OmniScheduler", FakeScheduler)
+    return records
 
-    stages.create_sglang_tts_engine_executor(
-        "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999"
+
+def test_higgs_tts_engine_default_enables_breakable_prefill_graphs(
+    monkeypatch,
+) -> None:
+    from sglang_omni.scheduling.generation_batch_policy import (
+        build_default_prefill_cuda_graph_bs,
     )
 
-    assert (
-        captured["checkpoint_dir"]
-        == "boson-sglang/higgs-audio-v3-TTS-4B-grpo05200410999"
-    )
+    records = _install_higgs_engine_build_fakes(monkeypatch)
+    captured = records["captured"]
+
+    stages.create_sglang_tts_engine_executor("bosonai/higgs-tts-3-4b")
+
+    assert captured["checkpoint_dir"] == "bosonai/higgs-tts-3-4b"
     assert captured["context_length"] == 4096
     assert captured["gpu_id"] == 0
     assert captured["overrides"]["disable_cuda_graph"] is False
@@ -129,13 +406,152 @@ def test_higgs_tts_engine_enables_cuda_graph_by_default(monkeypatch) -> None:
     ]
     assert captured["overrides"]["cuda_graph_max_bs"] == 64
     assert captured["overrides"]["max_running_requests"] == 64
+    assert "cuda_graph_config" not in captured["overrides"]
+    assert captured["overrides"]["cuda_graph_backend_prefill"] == "breakable"
+    assert captured["overrides"][
+        "cuda_graph_bs_prefill"
+    ] == build_default_prefill_cuda_graph_bs(512)
+    assert captured["server_args"].cuda_graph_config.prefill.backend == "breakable"
+    assert ("prefill", "backend") not in captured[
+        "server_args"
+    ]._cuda_graph_config_locked
+    assert captured["infra_kwargs"]["enable_prefill_input_embeds"] is True
+    assert len(records["attest_calls"]) == 1
     assert captured["server_args"].disable_overlap_schedule is True
     assert captured["server_args"].enable_torch_compile is False
     assert captured["server_args"].torch_compile_max_bs == 32
-    assert captured["adapter_kwargs"] == {"max_new_tokens_cap": 2048}
+    assert records["infrastructure_saw_graph_disabled"] == [True]
+    assert records["init_graph_calls"] == [True]
+    assert captured["adapter_kwargs"] == {
+        "max_new_tokens_cap": 2048,
+        "stream_stride": DEFAULT_HIGGS_STREAM_STRIDE,
+        "stream_followup_stride": DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
+        "initial_chunk_frames": DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES,
+    }
+    scheduler_kwargs = captured["scheduler_kwargs"]
+    assert (
+        scheduler_kwargs["abort_callback"]
+        == scheduler_kwargs["request_finished_callback"]
+    )
     assert (
         captured["stream_outbox"]
         is captured["scheduler_kwargs"]["model_runner"]._outbox
+    )
+
+
+def test_higgs_tts_engine_prefill_disable_keeps_decode_graphs(
+    monkeypatch,
+) -> None:
+    from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
+
+    records = _install_higgs_engine_build_fakes(monkeypatch)
+    captured = records["captured"]
+
+    builder = HiggsTtsEngineBuilder(
+        max_new_tokens=2048,
+        max_running_requests=64,
+        cuda_graph_max_bs=64,
+        enable_async_decode=False,
+        async_decode_min_batch_size=2,
+    )
+    builder.build(
+        "bosonai/higgs-tts-3-4b",
+        server_args_overrides={"cuda_graph_backend_prefill": "disabled"},
+    )
+
+    assert captured["overrides"]["disable_cuda_graph"] is False
+    assert captured["overrides"]["cuda_graph_backend_prefill"] == "disabled"
+    assert captured["server_args"].cuda_graph_config.prefill.backend == "disabled"
+    assert "enable_prefill_input_embeds" not in captured["infra_kwargs"]
+    assert records["attest_calls"] == []
+    assert records["init_graph_calls"] == [True]
+
+
+def test_higgs_tts_engine_lifecycle_callbacks_require_model() -> None:
+    from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
+
+    builder = HiggsTtsEngineBuilder(
+        max_new_tokens=2048,
+        max_running_requests=64,
+        cuda_graph_max_bs=64,
+        enable_async_decode=False,
+        async_decode_min_batch_size=2,
+    )
+
+    with pytest.raises(AssertionError):
+        builder.make_abort_callback()
+    with pytest.raises(AssertionError):
+        builder.make_request_finished_callback()
+
+    reset_calls: list[str] = []
+    builder.model = SimpleNamespace(reset_request=reset_calls.append)
+    abort_callback = builder.make_abort_callback()
+    request_finished_callback = builder.make_request_finished_callback()
+    abort_callback("req-1")
+    request_finished_callback("req-2")
+
+    assert reset_calls == ["req-1", "req-2"]
+
+
+def _make_higgs_builder(**kwargs):
+    from sglang_omni.models.higgs_tts.engine_builder import HiggsTtsEngineBuilder
+
+    return HiggsTtsEngineBuilder(
+        max_new_tokens=2048,
+        max_running_requests=64,
+        cuda_graph_max_bs=64,
+        enable_async_decode=False,
+        async_decode_min_batch_size=2,
+        **kwargs,
+    )
+
+
+def test_higgs_tts_engine_prefill_backend_policy() -> None:
+    from sglang_omni.models.higgs_tts import CAPABILITIES
+    from sglang_omni.scheduling.generation_batch_policy import (
+        build_default_prefill_cuda_graph_bs,
+    )
+
+    builder = _make_higgs_builder()
+
+    assert (
+        type(builder).supports_breakable_prefill_cuda_graph
+        is CAPABILITIES.supports_breakable_prefill_cuda_graph
+    )
+
+    defaults = builder.generation_defaults(dtype="bfloat16")
+    assert defaults["cuda_graph_backend_prefill"] == "breakable"
+    assert defaults["cuda_graph_bs_prefill"] == build_default_prefill_cuda_graph_bs(512)
+
+    server_args = FakeServerArgs(
+        cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(backend="disabled"))
+    )
+    builder.customize_server_args(server_args)
+    assert server_args.disable_overlap_schedule is True
+
+
+@pytest.mark.parametrize("fraction", [0.0, 1.0, 1.2, -0.1])
+def test_higgs_tts_engine_rejects_out_of_range_memory_fraction(fraction) -> None:
+    with pytest.raises(ValueError, match="total_gpu_memory_fraction"):
+        _make_higgs_builder(total_gpu_memory_fraction=fraction)
+
+
+def test_higgs_tts_engine_memory_budget_override_is_loud(caplog) -> None:
+    builder = _make_higgs_builder(total_gpu_memory_fraction=0.8)
+    assert builder.generation_defaults(dtype="bfloat16")["mem_fraction_static"] == 0.8
+
+    # Note: (Jiaxin Deng) the matching no-CLI-flag path stays silent.
+    with caplog.at_level(logging.WARNING):
+        builder.adjust_overrides({"mem_fraction_static": 0.8})
+        _make_higgs_builder().adjust_overrides({"mem_fraction_static": 0.9})
+    assert not caplog.records
+
+    # Note: (Jiaxin Deng) a diverging override (e.g. --talker-mem-fraction-static)
+    # wins but warns instead of silently shadowing the placement budget.
+    with caplog.at_level(logging.WARNING):
+        builder.adjust_overrides({"mem_fraction_static": 0.3})
+    assert any(
+        "total_gpu_memory_fraction" in record.message for record in caplog.records
     )
 
 
@@ -223,6 +639,99 @@ def test_higgs_reference_source_key_ignores_media_type() -> None:
     assert key_wav == key_mp3
     # Raw bytes and equivalent base64 resolve to the same content key.
     assert stages._reference_audio_cache_key({"bytes": raw}) == key_wav
+
+
+def test_higgs_preprocessing_prunes_preencoded_reference_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+
+    class FakeAdapter:
+        def __init__(self, _tokenizer) -> None:
+            pass
+
+        def build_prompt(
+            self, text: str, *, num_ref_tokens: int, reference_text: str | None
+        ) -> list[int]:
+            return [len(text), num_ref_tokens, len(reference_text or "")]
+
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", FakeAdapter)
+    preprocess = stages.create_preprocessing_executor("ckpt", num_codebooks=2)._fn
+    payload = StagePayload(
+        request_id="preencoded",
+        request=OmniRequest(
+            inputs={
+                "text": "hello",
+                "reference_text": "speaker",
+                "reference_codes": [[11, 12], [21, 22]],
+                "unrelated": {"keep": True},
+            },
+            params={},
+        ),
+        data={},
+    )
+
+    result = preprocess(payload)
+    state = HiggsTtsState.from_dict(result.data)
+
+    assert result.request.inputs == {
+        "text": "hello",
+        "reference_text": "speaker",
+        "unrelated": {"keep": True},
+    }
+    assert state.reference_codes_delayed is not None
+    assert state.prompt_token_ids == [5, 3, 7]
+    assert state.reference_waveform is None
+
+
+def test_higgs_preprocessing_prunes_raw_reference_inputs(monkeypatch) -> None:
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(stages.Tokenizer, "from_file", lambda _path: object())
+    monkeypatch.setattr(
+        stages,
+        "PreTrainedTokenizerFast",
+        lambda tokenizer_object: object(),
+    )
+    monkeypatch.setattr(stages, "HiggsTokenizerAdapter", lambda _tokenizer: object())
+    monkeypatch.setattr(
+        stages,
+        "load_audio_to_24k",
+        lambda _reference_audio: (np.zeros(16, dtype=np.float32), 24000),
+    )
+
+    preprocess = stages.create_preprocessing_executor("ckpt", num_codebooks=2)._fn
+    payload = StagePayload(
+        request_id="raw-audio",
+        request=OmniRequest(
+            inputs={
+                "text": "hello",
+                "reference_text": "speaker",
+                "reference_audio": {"bytes": b"fake wav"},
+                "references": [{"audio_path": "unused.wav", "text": "speaker"}],
+                "unrelated": 7,
+            },
+            params={},
+        ),
+        data={},
+    )
+
+    result = preprocess(payload)
+    state = HiggsTtsState.from_dict(result.data)
+
+    assert result.request.inputs == {
+        "text": "hello",
+        "reference_text": "speaker",
+        "unrelated": 7,
+    }
+    assert state.target_text == "hello"
+    assert state.reference_text == "speaker"
+    assert state.reference_waveform is not None
+    assert tuple(state.reference_waveform.shape) == (1, 1, 16)
+    assert state.reference_code_cache_key is not None
 
 
 def test_higgs_audio_encoder_uses_reference_code_cache(monkeypatch) -> None:
@@ -327,7 +836,11 @@ def test_higgs_audio_encoder_uses_shared_cache_for_uploaded_voice(
 
         def encode_reference(self, waveform, sample_rate: int) -> torch.Tensor:
             self.calls += 1
-            return torch.tensor([[11, 12], [21, 22]], dtype=torch.long)
+            offset = self.calls * 100
+            return torch.tensor(
+                [[offset + 11, offset + 12], [offset + 21, offset + 22]],
+                dtype=torch.long,
+            )
 
     cache = get_speaker_artifact_cache()
     cache.clear()
@@ -343,14 +856,20 @@ def test_higgs_audio_encoder_uses_shared_cache_for_uploaded_voice(
     fake_codec.calls = 0
     encode = scheduler._fn
 
-    def make_payload(request_id: str) -> StagePayload:
+    def make_payload(
+        request_id: str,
+        *,
+        reference_code_cache_key: str = "waveform:sr:24000:uploaded",
+        uploaded_voice_created_at: int = 7,
+        waveform_value: float = 0.0,
+    ) -> StagePayload:
         state = HiggsTtsState(
-            reference_waveform=torch.zeros(1, 1, 16),
-            reference_code_cache_key="waveform:sr:24000:uploaded",
+            reference_waveform=torch.full((1, 1, 16), waveform_value),
+            reference_code_cache_key=reference_code_cache_key,
             target_text="hello",
             reference_text="speaker",
             uploaded_voice_name="guide",
-            uploaded_voice_created_at=7,
+            uploaded_voice_created_at=uploaded_voice_created_at,
             num_codebooks=2,
         )
         return StagePayload(
@@ -364,12 +883,27 @@ def test_higgs_audio_encoder_uses_shared_cache_for_uploaded_voice(
     cache.clear_voice("guide")
     third = encode(make_payload("third"))
 
+    assert fake_codec.calls == 1
+
+    reuploaded = encode(
+        make_payload(
+            "reuploaded",
+            reference_code_cache_key="waveform:sr:24000:uploaded-v2",
+            uploaded_voice_created_at=8,
+            waveform_value=1.0,
+        )
+    )
+
     assert fake_codec.calls == 2
     assert (
         first.data["reference_codes_delayed"] == second.data["reference_codes_delayed"]
     )
     assert (
         third.data["reference_codes_delayed"] == first.data["reference_codes_delayed"]
+    )
+    assert (
+        reuploaded.data["reference_codes_delayed"]
+        != first.data["reference_codes_delayed"]
     )
 
 
@@ -490,7 +1024,7 @@ def test_higgs_model_runner_marks_sampler_finish() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=None,
         finished=lambda: False,
     )
@@ -526,7 +1060,7 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=None,
         finished=lambda: False,
     )
@@ -537,13 +1071,20 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
         return_omni_rollout=False,
         return_logprob=False,
         generation_done=False,
+        num_codebooks=3,
         stream_metadata={
             "modality": "audio_codes",
             "stream": True,
             "num_codebooks": 3,
             "codebook_size": 17,
             "initial_codec_chunk_frames": 2,
+            HIGGS_STREAM_STRIDE_METADATA: DEFAULT_HIGGS_STREAM_STRIDE,
+            HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA: DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
         },
+        stream_code_buffer=[],
+        stream_code_first_flush_done=False,
+        stream_code_seen_rows=0,
+        stream_code_next_flush_rows=0,
     )
     result = SimpleNamespace(
         logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
@@ -564,7 +1105,145 @@ def test_higgs_model_runner_emits_latched_stream_metadata() -> None:
         "num_codebooks": 3,
         "codebook_size": 17,
         "initial_codec_chunk_frames": 2,
+        HIGGS_STREAM_STRIDE_METADATA: DEFAULT_HIGGS_STREAM_STRIDE,
+        HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA: DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
     }
+
+
+def test_higgs_request_finish_flushes_partial_stream_window() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = queue.Queue()
+    runner._vocoder_target = "vocoder"
+    data = SimpleNamespace(
+        stream_code_buffer=[
+            torch.tensor([1, 2, 3]),
+            torch.tensor([4, 5, 6]),
+        ],
+        stream_code_seen_rows=2,
+        stream_code_first_flush_done=False,
+        stream_metadata={"modality": "audio_codes", "stream": True},
+    )
+
+    runner.on_request_finished("req-tail", data)
+
+    output = runner._outbox.get_nowait()
+    assert output.request_id == "req-tail"
+    assert output.type == "stream"
+    assert output.data.tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert data.stream_code_buffer == []
+    assert data.stream_code_first_flush_done is True
+
+
+def test_higgs_model_runner_batches_stream_code_rows_on_decode_boundaries() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = queue.Queue()
+    runner._vocoder_target = "vocoder"
+    data = SimpleNamespace(
+        stream_metadata={
+            "modality": "audio_codes",
+            "stream": True,
+            "num_codebooks": 3,
+            "codebook_size": 17,
+            HIGGS_STREAM_STRIDE_METADATA: 3,
+            HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA: 8,
+        },
+        num_codebooks=3,
+        output_codes=[],
+        max_new_tokens=99,
+        generation_done=False,
+        stream_code_buffer=[],
+        stream_code_first_flush_done=False,
+        stream_code_seen_rows=0,
+        stream_code_next_flush_rows=0,
+    )
+    sched_req = SimpleNamespace(request_id="req", data=data)
+
+    for i in range(2):
+        runner._queue_or_emit_code_chunk(
+            sched_req, torch.tensor([i, i + 1, i + 2], dtype=torch.long)
+        )
+    with pytest.raises(queue.Empty):
+        runner._outbox.get_nowait()
+
+    runner._queue_or_emit_code_chunk(
+        sched_req, torch.tensor([2, 3, 4], dtype=torch.long)
+    )
+    first = runner._outbox.get_nowait()
+    assert first.type == "stream"
+    assert first.target == "vocoder"
+    assert first.data.tolist() == [[0, 1, 2], [1, 2, 3], [2, 3, 4]]
+    assert data.stream_code_first_flush_done is True
+
+    for i in range(7):
+        runner._queue_or_emit_code_chunk(
+            sched_req, torch.tensor([10 + i, 11 + i, 12 + i], dtype=torch.long)
+        )
+    with pytest.raises(queue.Empty):
+        runner._outbox.get_nowait()
+
+    runner._queue_or_emit_code_chunk(
+        sched_req, torch.tensor([17, 18, 19], dtype=torch.long)
+    )
+    second = runner._outbox.get_nowait()
+    assert second.data.shape == (8, 3)
+    assert second.data[0].tolist() == [10, 11, 12]
+    assert second.data[-1].tolist() == [17, 18, 19]
+
+
+def test_higgs_model_runner_collect_streaming_uses_preallocated_buffer() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = queue.Queue()
+    runner._vocoder_target = "vocoder"
+    runner.model = SimpleNamespace(
+        _rid_to_row={"req": 0},
+        _output_codes={"req": []},
+        _sampler_pool=SimpleNamespace(generation_done=torch.tensor([False])),
+    )
+    req = SimpleNamespace(
+        inflight_middle_chunks=0,
+        finished_reason=None,
+        finished=lambda: False,
+    )
+    data = SimpleNamespace(
+        req=req,
+        output_codes=[],
+        output_code_buffer=None,
+        output_code_count=0,
+        output_logprobs=[],
+        return_omni_rollout=False,
+        return_logprob=False,
+        generation_done=False,
+        max_new_tokens=2,
+        num_codebooks=3,
+        stream_metadata={
+            "modality": "audio_codes",
+            "stream": True,
+            "num_codebooks": 3,
+            "codebook_size": 17,
+            HIGGS_STREAM_STRIDE_METADATA: 8,
+            HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA: 8,
+        },
+        stream_code_buffer=[],
+        stream_code_first_flush_done=False,
+        stream_code_seen_rows=0,
+        stream_code_next_flush_rows=0,
+    )
+    result = SimpleNamespace(
+        logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
+    )
+    sched_req = SimpleNamespace(request_id="req", data=data)
+
+    for row in ([10, 11, 12], [13, 14, 15]):
+        runner.model._output_codes["req"] = [torch.tensor(row, dtype=torch.long)]
+        runner._collect_step_outputs(result, [sched_req])
+
+    out = runner._outbox.get_nowait()
+    assert out.type == "stream"
+    assert out.target == "vocoder"
+    assert out.data.tolist() == [[10, 11, 12], [13, 14, 15]]
+    assert data.output_codes == []
+    assert data.output_code_count == 2
+    assert data.output_code_buffer[:2].tolist() == [[10, 11, 12], [13, 14, 15]]
 
 
 def test_higgs_stream_metadata_carries_initial_codec_chunk_frames() -> None:
@@ -586,7 +1265,77 @@ def test_higgs_stream_metadata_carries_initial_codec_chunk_frames() -> None:
         "num_codebooks": 3,
         "codebook_size": 17,
         "initial_codec_chunk_frames": 1,
+        HIGGS_STREAM_STRIDE_METADATA: DEFAULT_HIGGS_STREAM_STRIDE,
+        HIGGS_STREAM_FOLLOWUP_STRIDE_METADATA: DEFAULT_HIGGS_STREAM_FOLLOWUP_STRIDE,
     }
+
+
+@pytest.mark.parametrize(
+    ("request_params", "expected"),
+    [
+        ({"stream": True}, DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES),
+        ({"stream": True, "initial_codec_chunk_frames": 0}, 0),
+    ],
+)
+def test_higgs_stream_metadata_resolves_model_default_and_explicit_zero(
+    request_params: dict[str, Any], expected: int
+) -> None:
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="", params=request_params),
+        data={},
+    )
+
+    metadata = build_higgs_stream_metadata(
+        payload,
+        SimpleNamespace(num_codebooks=8, codebook_size=1026),
+    )
+
+    assert metadata["initial_codec_chunk_frames"] == expected
+
+
+def test_higgs_producer_flushes_default_initial_chunk_at_row_27() -> None:
+    runner = object.__new__(HiggsTTSModelRunner)
+    runner._outbox = queue.Queue()
+    runner._vocoder_target = "vocoder"
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="", params={"stream": True}),
+        data={},
+    )
+    metadata = build_higgs_stream_metadata(
+        payload,
+        SimpleNamespace(num_codebooks=8, codebook_size=1026),
+    )
+    data = SimpleNamespace(
+        stream_metadata=metadata,
+        num_codebooks=8,
+        output_codes=[],
+        max_new_tokens=99,
+        generation_done=False,
+        stream_code_buffer=[],
+        stream_code_first_flush_done=False,
+        stream_code_seen_rows=0,
+        stream_code_next_flush_rows=0,
+    )
+    sched_req = SimpleNamespace(request_id="req", data=data)
+
+    for row in range(26):
+        runner._queue_or_emit_code_chunk(
+            sched_req,
+            torch.full((8,), row, dtype=torch.long),
+        )
+    with pytest.raises(queue.Empty):
+        runner._outbox.get_nowait()
+
+    runner._queue_or_emit_code_chunk(
+        sched_req,
+        torch.full((8,), 26, dtype=torch.long),
+    )
+    message = runner._outbox.get_nowait()
+
+    assert message.data.shape == (27, 8)
+    assert message.metadata["initial_codec_chunk_frames"] == 20
 
 
 def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
@@ -611,7 +1360,9 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
             step_count=torch.zeros(1, dtype=torch.long),
         ),
     )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
+    req = SimpleNamespace(
+        inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+    )
     data = SimpleNamespace(
         req=req,
         output_codes=[],
@@ -666,10 +1417,18 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
     )
     # row0 chunked, row1 was-done, row2 active (not done), row3 active (EOC done).
     reqs = [
-        SimpleNamespace(is_chunked=1, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
-        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(
+            inflight_middle_chunks=1, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
+        SimpleNamespace(
+            inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+        ),
     ]
     datas = [
         SimpleNamespace(
@@ -735,7 +1494,9 @@ def test_higgs_model_runner_collects_rollout_logprobs_only_when_requested() -> N
             last_codes=torch.zeros((n, k), dtype=torch.long),
         ),
     )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
+    req = SimpleNamespace(
+        inflight_middle_chunks=0, finished_reason=None, finished=lambda: False
+    )
     data = SimpleNamespace(
         req=req,
         output_codes=[],
@@ -774,7 +1535,7 @@ def test_higgs_model_runner_skips_already_finished_eager_request() -> None:
         _sampler_pool=SimpleNamespace(generation_done=torch.tensor([True])),
     )
     req = SimpleNamespace(
-        is_chunked=0,
+        inflight_middle_chunks=0,
         finished_reason=object(),
         finished=lambda: True,
     )
@@ -825,6 +1586,27 @@ def _fake_codec_fixtures(monkeypatch):
     return decode_batch_sizes
 
 
+def test_higgs_vocoder_fails_startup_when_cuda_graph_capture_fails(
+    monkeypatch,
+) -> None:
+    class FailingCodec:
+        def capture_decode_cuda_graphs(self, _frame_counts) -> None:
+            raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda path: path)
+    monkeypatch.setattr(
+        stages,
+        "get_or_load_codec",
+        lambda *_args, **_kwargs: FailingCodec(),
+    )
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        stages.create_vocoder_executor(
+            "fake-model",
+            decode_cuda_graph_frame_counts=(1, 2),
+        )
+
+
 def test_higgs_tts_vocoder_batches_decode_requests(
     monkeypatch,
 ) -> None:
@@ -834,6 +1616,7 @@ def test_higgs_tts_vocoder_batches_decode_requests(
     scheduler = stages.create_vocoder_executor(
         "fake-model", vocoder_decode_batch_size=4, max_batch_wait_ms=2
     )
+    assert scheduler._default_initial_chunk_frames == DEFAULT_HIGGS_INITIAL_CHUNK_FRAMES
 
     p1 = _make_payload(
         "r1",
@@ -1133,6 +1916,71 @@ def test_higgs_streaming_vocoder_matches_full_decode_with_codec_tail() -> None:
     np.testing.assert_array_equal(streamed, full.numpy())
 
 
+def test_higgs_streaming_vocoder_accepts_batched_code_rows() -> None:
+    raw_codes = torch.tensor(
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+            [10, 11, 12],
+            [13, 14, 15],
+            [16, 17, 18],
+        ],
+        dtype=torch.long,
+    )
+    delayed = apply_delay_pattern(raw_codes)
+    codec = _FakeUnevenHiggsStreamingCodec()
+    scheduler = HiggsStreamingVocoderScheduler(
+        codec,
+        stream_stride=3,
+        stream_followup_stride=2,
+        stream_overlap_tokens=1,
+        stream_holdback_tokens=0,
+    )
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=delayed.tolist(),
+        codebook_size=64,
+    )
+    full = scheduler._decode_state_to_audio(HiggsTtsState.from_dict(payload.data))
+    assert full is not None
+
+    scheduler._on_streaming_new_request("req", payload)
+    scheduler._on_chunk("req", _higgs_stream_item(delayed[:3], codebook_size=64))
+    scheduler._on_chunk("req", _higgs_stream_item(delayed[3:], codebook_size=64))
+    scheduler._on_done("req")
+
+    stream_chunks = [
+        np.frombuffer(msg.data["audio_waveform"], dtype=np.float32).copy()
+        for msg in _drain_higgs_outbox(scheduler)
+        if msg.type == "stream"
+    ]
+    streamed = np.concatenate(stream_chunks)
+    np.testing.assert_array_equal(streamed, full.numpy())
+
+
+def test_higgs_streaming_vocoder_rejects_bad_batched_code_width() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
+    payload = _higgs_stream_payload(
+        "req",
+        stream=True,
+        delayed_rows=[[1, 2, 3]],
+        codebook_size=64,
+    )
+    scheduler._on_streaming_new_request("req", payload)
+
+    with pytest.raises(ValueError, match="expected 3"):
+        scheduler._on_chunk(
+            "req",
+            _higgs_stream_item(
+                torch.ones((2, 4), dtype=torch.long),
+                num_codebooks=3,
+                codebook_size=64,
+            ),
+        )
+
+
 def test_higgs_initial_codec_chunk_frames_controls_first_chunk_only() -> None:
     raw_codes = torch.tensor(
         [
@@ -1218,6 +2066,42 @@ def test_higgs_initial_chunk_resumes_after_followup_boundary() -> None:
     assert len(second_streams) == 1
 
 
+def test_higgs_stream_contract_change_rejects_chunk_without_buffering() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
+    payload = _higgs_stream_payload("req", stream=True, delayed_rows=[[1, 2, 3]])
+    scheduler._on_streaming_new_request("req", payload)
+
+    row = torch.tensor([1, 2, 3], dtype=torch.long)
+    with pytest.raises(ValueError, match="num_codebooks changed for"):
+        scheduler._on_chunk("req", _higgs_stream_item(row, num_codebooks=4))
+    with pytest.raises(ValueError, match="codebook_size changed for"):
+        scheduler._on_chunk("req", _higgs_stream_item(row, codebook_size=21))
+    assert scheduler._stream_states["req"].delayed_rows == []
+
+
+def test_higgs_stream_contract_requires_integer_values() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
+    payload = _higgs_stream_payload("req", stream=True, delayed_rows=[[1, 2, 3]])
+    scheduler._on_streaming_new_request("req", payload)
+
+    item = _higgs_stream_item(torch.tensor([1, 2, 3], dtype=torch.long))
+    item.metadata["num_codebooks"] = "three"
+    with pytest.raises(TypeError, match="must include integer"):
+        scheduler._on_chunk("req", item)
+    assert scheduler._stream_states["req"].delayed_rows == []
+
+
+def test_higgs_streaming_payload_missing_contract_fields_errors() -> None:
+    scheduler = HiggsStreamingVocoderScheduler(_FakeHiggsStreamingCodec())
+    payload = StagePayload(
+        request_id="req",
+        request=OmniRequest(inputs="", params={"stream": True}),
+        data={},
+    )
+    with pytest.raises(RuntimeError, match="is missing fields"):
+        scheduler._on_streaming_new_request("req", payload)
+
+
 def _drain_higgs_outbox(
     scheduler: HiggsStreamingVocoderScheduler,
 ) -> list:
@@ -1250,6 +2134,11 @@ def _make_fake_codec(call_log: list[tuple[int, int]]):
     codec.model = FakeModel()
     codec.device = torch.device("cpu")
     codec._dtype = torch.float32
+    codec._decode_cuda_graphs = {}
+    codec._decode_cuda_graph_hits = 0
+    codec._decode_cuda_graph_misses = 0
+    codec._decode_cuda_graph_missed_shapes = set()
+    codec._decode_single_flight_lock = threading.Lock()
     return codec
 
 
@@ -1322,6 +2211,10 @@ def _make_fake_encoder_codec(encode_calls: list):
     codec.model = FakeModel()
     codec.device = torch.device("cpu")
     codec._dtype = torch.float32
+    codec._decode_cuda_graphs = {}
+    codec._decode_cuda_graph_hits = 0
+    codec._decode_cuda_graph_misses = 0
+    codec._decode_cuda_graph_missed_shapes = set()
     return codec
 
 
@@ -1426,3 +2319,77 @@ def test_higgs_audio_codec_encode_batch_input_normalisation() -> None:
         assert torch.equal(
             r, ref
         ), f"input format {i} produced different codes than encode_reference"
+
+
+def test_higgs_mem_fraction_role_to_stage_targets_tts_engine() -> None:
+    assert HiggsTtsPipelineConfig.mem_fraction_role_to_stage() == {
+        "talker": "tts_engine"
+    }
+    assert HiggsTtsPipelineConfig.talker_sglang_role_to_stage() == {
+        "talker": "tts_engine"
+    }
+
+
+def test_higgs_cli_mem_fraction_static_pins_tts_engine() -> None:
+    config = HiggsTtsPipelineConfig(model_path="fake-model")
+
+    apply_mem_fraction_cli_overrides(
+        config,
+        mem_fraction_static=0.27,
+        thinker_mem_fraction_static=None,
+        talker_mem_fraction_static=None,
+    )
+
+    tts_engine = next(s for s in config.stages if s.name == "tts_engine")
+    assert tts_engine.runtime.sglang_server_args.mem_fraction_static == 0.27
+
+
+def test_higgs_cli_talker_mem_fraction_static_pins_tts_engine() -> None:
+    config = HiggsTtsPipelineConfig(model_path="fake-model")
+
+    apply_mem_fraction_cli_overrides(
+        config,
+        mem_fraction_static=None,
+        thinker_mem_fraction_static=None,
+        talker_mem_fraction_static=0.3,
+    )
+
+    tts_engine = next(s for s in config.stages if s.name == "tts_engine")
+    assert tts_engine.runtime.sglang_server_args.mem_fraction_static == 0.3
+
+
+def test_higgs_cli_rejects_unsupported_thinker_mem_fraction() -> None:
+    config = HiggsTtsPipelineConfig(model_path="fake-model")
+
+    with pytest.raises(typer.BadParameter):
+        apply_mem_fraction_cli_overrides(
+            config,
+            mem_fraction_static=None,
+            thinker_mem_fraction_static=0.3,
+            talker_mem_fraction_static=None,
+        )
+
+
+def test_higgs_bounds_preprocessing_without_global_omp_default() -> None:
+    config = HiggsTtsPipelineConfig(model_path="dummy")
+    preprocessing = next(
+        stage for stage in config.stages if stage.name == "preprocessing"
+    )
+
+    assert preprocessing.factory_args["max_concurrency"] == 2
+    assert "OMP_NUM_THREADS" not in config.env_defaults
+    assert int(preprocessing.env["OMP_NUM_THREADS"]) >= 1
+    assert int(preprocessing.env["OMP_NUM_THREADS"]) <= 8
+
+
+def test_higgs_preserves_pipeline_omp_override() -> None:
+    config = HiggsTtsPipelineConfig(
+        model_path="dummy",
+        env_defaults={"OMP_NUM_THREADS": "3"},
+    )
+    preprocessing = next(
+        stage for stage in config.stages if stage.name == "preprocessing"
+    )
+
+    assert config.env_defaults["OMP_NUM_THREADS"] == "3"
+    assert "OMP_NUM_THREADS" not in preprocessing.env

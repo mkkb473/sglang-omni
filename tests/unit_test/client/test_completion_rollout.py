@@ -6,7 +6,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from sglang_omni.client import Client
+from sglang_omni.client.client import _extract_inputs
 from sglang_omni.client.types import GenerateRequest
 
 
@@ -49,6 +52,29 @@ def test_completion_surfaces_logprobs_and_weight_version() -> None:
 
     assert out.output_token_logprobs == [[-0.1, 11], [-0.2, 22], [-0.3, 33]]
     assert out.weight_version == "v7"
+
+
+def test_speech_surfaces_finish_reason() -> None:
+    client = Client(
+        _SubmitStubCoordinator(
+            {
+                "audio_data": [0.0, 0.1, -0.1],
+                "sample_rate": 24000,
+                "finish_reason": "length",
+            }
+        )
+    )
+
+    result = asyncio.run(
+        client.speech(
+            GenerateRequest(prompt="hello"),
+            request_id="speech-1",
+            response_format="pcm",
+        )
+    )
+
+    assert result.finish_reason == "length"
+    assert result.mime_type == "audio/pcm"
 
 
 def test_completion_surfaces_omni_rollout() -> None:
@@ -164,3 +190,26 @@ def test_completion_concatenates_streamed_logprobs() -> None:
     assert out.output_token_logprobs == [[-0.1, 11], [-0.2, 22], [-0.3, 33]]
     assert out.weight_version == "v7"
     assert out.omni_rollout == {"version": 1, "action_streams": []}
+
+
+def test_extract_inputs_rejects_prompt_with_multimodal_train_inputs() -> None:
+    request = GenerateRequest(
+        prompt="hi",
+        multimodal_train_inputs={"version": 1, "tensors": {}},
+    )
+
+    with pytest.raises(ValueError, match="requires prompt_token_ids"):
+        _extract_inputs(request)
+
+
+def test_extract_inputs_passes_pretokenized_multimodal_train_inputs() -> None:
+    bundle = {"version": 1, "tensors": {}}
+    request = GenerateRequest(
+        prompt_token_ids=[1, 2, 3],
+        multimodal_train_inputs=bundle,
+    )
+
+    assert _extract_inputs(request) == {
+        "input_ids": [1, 2, 3],
+        "multimodal_train_inputs": bundle,
+    }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import collections
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from sglang_omni.config import build_process_topology_plan, build_stage_placement_plan
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from sglang_omni.models.voxtral_tts.config import VoxtralTTSPipelineConfig
 from sglang_omni.models.voxtral_tts.io import VoxtralTTSState
@@ -17,6 +19,7 @@ from sglang_omni.models.voxtral_tts.request_builders import build_sglang_voxtral
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.types import RequestOutput
 from sglang_omni.utils.audio_payload import audio_waveform_payload
+from tests.unit_test.fakes import FakeExecutionBridge, FakeServerArgs
 
 
 def test_voxtral_tts_config_uses_current_stage_schema() -> None:
@@ -30,7 +33,17 @@ def test_voxtral_tts_config_uses_current_stage_schema() -> None:
     assert config.gpu_placement == {"tts_generation": 0, "vocoder": 0}
     assert "device" not in config.stages[1].factory_args
     assert "device" not in config.stages[2].factory_args
-    assert {stage.process for stage in config.stages} == {"pipeline"}
+    assert [stage.process for stage in config.stages] == [
+        "pipeline",
+        "pipeline",
+        "pipeline",
+    ]
+    assert [
+        stage.runtime.resources.total_gpu_memory_fraction
+        for stage in config.stages
+        if stage.gpu is not None
+    ] == [None, None]
+    build_process_topology_plan(config, build_stage_placement_plan(config))
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("VoxtralTTSForConditionalGeneration")
         is VoxtralTTSPipelineConfig
@@ -162,6 +175,57 @@ def test_voxtral_audio_codes_payload_is_compact() -> None:
     assert restored.audio_codes.tolist() == [[1, 2], [3, 4]]
 
 
+def test_voxtral_vocoder_preserves_warmup_trim_and_fade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_codes: list[torch.Tensor] = []
+
+    class FakeAudioTokenizer:
+        sampling_rate = 1000
+        downsample_factor = 3
+
+        def decode_helper_batch_async(self, codes_list):
+            seen_codes.extend(codes.clone() for codes in codes_list)
+            return [torch.arange(20, dtype=torch.float32)]
+
+    monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(
+        stages,
+        "_load_audio_tokenizer",
+        lambda *args, **kwargs: FakeAudioTokenizer(),
+    )
+
+    scheduler = stages.create_vocoder_executor("model", device="cpu")
+    payload = StagePayload(
+        request_id="voxtral-vocoder",
+        request=OmniRequest(inputs="hello", params={}),
+        data=VoxtralTTSState(
+            audio_codes=torch.tensor([[9, 10], [11, 12]], dtype=torch.long),
+            prompt_tokens=2,
+            completion_tokens=4,
+        ).to_dict(),
+    )
+
+    result = asyncio.run(scheduler._fn(payload))
+
+    assert scheduler._max_batch_size == 1
+    assert scheduler._max_batch_wait_s == 0
+    assert [codes.tolist() for codes in seen_codes] == [
+        [[9, 10], [9, 10], [9, 10], [11, 12]]
+    ]
+    audio = np.frombuffer(result.data["audio_waveform"], dtype=np.float32)
+    expected = torch.arange(6, 20, dtype=torch.float32)
+    expected[:10] *= torch.linspace(0, 1, 10)
+    assert audio.tolist() == pytest.approx(expected.tolist())
+    assert result.data["sample_rate"] == 1000
+    assert result.data["modality"] == "audio"
+    assert result.data["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 4,
+        "total_tokens": 6,
+    }
+
+
 def test_voxtral_collect_audio_step_reuses_output_tokens_for_eos_filter() -> None:
     from sglang_omni.models.voxtral_tts.acoustic_transformer import AudioSpecialTokens
     from sglang_omni.models.voxtral_tts.model_runner import VoxtralTTSModelRunner
@@ -201,7 +265,6 @@ def test_voxtral_collect_audio_step_reuses_output_tokens_for_eos_filter() -> Non
     runner._collect_audio_step(result, schedule_batch, requests)
 
     assert result.next_token_ids.tolist() == [11, eos_id]
-    assert schedule_batch.output_ids.tolist() == [11, eos_id]
     assert requests[0].data.output_codes == []
     assert requests[1].data.output_codes == []
 
@@ -287,7 +350,9 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
     monkeypatch.setattr(
         forward_batch_info.ForwardBatch,
         "init_new",
-        staticmethod(lambda model_worker_batch, model_runner: fake_forward_batch),
+        staticmethod(
+            lambda model_worker_batch, model_runner, *, capture_hidden_mode=None, return_hidden_states_before_norm: fake_forward_batch
+        ),
     )
 
     class FakeVoxtralModel:
@@ -331,6 +396,7 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
     runner.output_processor = FakeOutputProcessor()
     runner.device = torch.device("cpu")
     runner.model = runner.tp_worker.model_runner.model
+    runner.bind_execution_bridge(FakeExecutionBridge())
 
     data = SimpleNamespace(
         pending_feedback_queue=collections.deque([torch.tensor([1.0, 2.0, 3.0])]),
@@ -342,8 +408,6 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
     schedule_batch = SimpleNamespace(
         forward_mode=SimpleNamespace(is_extend=lambda: False),
         is_prefill_only=False,
-        output_ids=None,
-        get_model_worker_batch=lambda: SimpleNamespace(),
     )
 
     output = runner.execute(
@@ -351,7 +415,6 @@ def test_voxtral_steady_decode_reports_cuda_graph_ready(
     )
 
     assert output.can_run_cuda_graph is True
-    assert schedule_batch.output_ids.tolist() == [5]
     assert torch.equal(
         runner.model._decode_input_embed_buffer,
         torch.tensor([[1.0, 2.0, 3.0]]),
@@ -398,6 +461,7 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     from sglang_omni.models.voxtral_tts import request_builders
     from sglang_omni.models.voxtral_tts.pipeline import stages
     from sglang_omni.scheduling import bootstrap as bootstrap_mod
+    from sglang_omni.scheduling import engine_factory
     from sglang_omni.scheduling import omni_scheduler as scheduler_mod
     from sglang_omni.scheduling import sglang_backend
 
@@ -413,7 +477,7 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
             self.server_args = server_args
             self.model = FakeModel()
 
-        def init_device_graphs(self) -> None:
+        def init_cuda_graphs(self) -> None:
             assert self.server_args.enable_torch_compile is True
             assert self.server_args.torch_compile_max_bs == 16
             init_graph_calls.append(True)
@@ -421,8 +485,11 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     class FakeWorker:
         def __init__(self, server_args) -> None:
             self.model_runner = FakeSGLangRunner(server_args)
+            self.enable_prefill_input_embeds = False
 
-    monkeypatch.setattr(stages, "_resolve_checkpoint", lambda model_path: model_path)
+    monkeypatch.setattr(
+        engine_factory, "_resolve_checkpoint", lambda model_path: model_path
+    )
     monkeypatch.setattr(
         stages,
         "_write_voxtral_sglang_config",
@@ -442,9 +509,16 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     def fake_build_sglang_server_args(model_path, context_length, **kwargs):
         del model_path, context_length
         build_kwargs.update(kwargs)
-        return SimpleNamespace(
+        return FakeServerArgs(
             cuda_graph_bs=kwargs["cuda_graph_bs"],
             cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(
+                    max_bs=kwargs["cuda_graph_max_bs"],
+                    bs=kwargs["cuda_graph_bs"],
+                ),
+                prefill=SimpleNamespace(backend="disabled", bs=None, max_bs=None),
+            ),
             disable_cuda_graph=kwargs["disable_cuda_graph"],
             disable_overlap_schedule=kwargs["disable_overlap_schedule"],
             enable_torch_compile=kwargs["enable_torch_compile"],

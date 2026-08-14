@@ -14,6 +14,7 @@ class S2ProPipelineConfig(PipelineConfig):
     """3-stage TTS pipeline: preprocessing → tts_engine → vocoder."""
 
     architecture: ClassVar[str] = "FishQwen3OmniForCausalLM"
+    requires_model_capabilities: ClassVar[bool] = True
 
     @classmethod
     def talker_sglang_role_to_stage(cls) -> dict[str, str]:
@@ -23,11 +24,27 @@ class S2ProPipelineConfig(PipelineConfig):
     def generation_sglang_role_to_stage(cls) -> dict[str, str]:
         return {"generation": "tts_engine"}
 
+    @classmethod
+    def process_safe_edges(cls) -> frozenset[tuple[str, str]]:
+        # preprocessing -> tts_engine is already cross-process by default.
+        return frozenset({("preprocessing", "tts_engine"), ("tts_engine", "vocoder")})
+
+    @classmethod
+    def process_edge_resources(
+        cls,
+    ) -> dict[tuple[str, str], dict[str, float]]:
+        return {
+            ("tts_engine", "vocoder"): {
+                "tts_engine": 0.85,
+                "vocoder": 0.10,
+            }
+        }
+
     model_path: str
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
-            process="pipeline",
+            process="preprocessing",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
             next="tts_engine",
         ),

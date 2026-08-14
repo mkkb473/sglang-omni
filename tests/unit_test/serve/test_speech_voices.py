@@ -134,10 +134,17 @@ def test_voice_routes_upload_list_use_and_delete(tmp_path: Path, monkeypatch) ->
     assert listed.json()["uploaded_voices"][0]["ref_text"] == (
         "The narrator reference transcript."
     )
+    names_only = client.get("/v1/audio/voices", params={"names_only": "true"})
+    assert names_only.json() == {"uploaded_voice_names": ["Narrator_01"]}
 
     speech = client.post(
         "/v1/audio/speech",
-        json={"input": "hello", "voice": "narrator_01", "response_format": "wav"},
+        json={
+            "model": "tts",
+            "input": "hello",
+            "voice": "narrator_01",
+            "response_format": "wav",
+        },
     )
     assert speech.status_code == 200
     prompt = client_impl.requests[-1].prompt
@@ -515,7 +522,9 @@ def test_speech_service_uses_same_uploaded_voice_resolution_for_prompt_and_param
     )
     service = SpeechRequestValidator(default_model="tts", voice_store=store)
 
-    prepared = service.parse_generation_request({"input": "hello", "voice": "anchor"})
+    prepared = service.parse_generation_request(
+        {"model": "tts", "input": "hello", "voice": "anchor"}
+    )
     store.upload(
         name="Anchor",
         consent="consent",
@@ -546,8 +555,10 @@ def test_speech_service_rejects_unknown_required_uploaded_voice(
         voice_store=store,
     )
 
-    with pytest.raises(SpeechAPIError, match="Unknown voice"):
+    with pytest.raises(SpeechAPIError, match="Unknown voice") as exc_info:
         service.parse_request({"input": "hello", "voice": "missing"})
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "BadRequestError"
 
 
 def test_speech_service_rejects_batch_default_uploaded_voice_task_type(
@@ -569,9 +580,29 @@ def test_speech_service_rejects_batch_default_uploaded_voice_task_type(
     with pytest.raises(SpeechAPIError, match="uploaded voice requests require"):
         service.parse_batch_request(
             {
+                "model": "public-tts-name",
                 "voice": "Anchor",
                 "task_type": "VoiceDesign",
                 "items": [{"input": "hello"}],
+            }
+        )
+
+
+def test_speech_service_validates_batch_default_voice_before_item_references(
+    tmp_path: Path,
+) -> None:
+    store = SpeakerSampleStore(root_dir=tmp_path)
+    service = SpeechRequestValidator(
+        default_model="public-tts-name",
+        requires_uploaded_voice_for_named_voice=True,
+        voice_store=store,
+    )
+
+    with pytest.raises(SpeechAPIError, match="Unknown voice"):
+        service.parse_batch_request(
+            {
+                "voice": "Missing",
+                "items": [{"input": "hello", "ref_audio": "data:audio/wav"}],
             }
         )
 

@@ -5,16 +5,21 @@ from sglang_omni.config.placement import (
     StagePlacementPlan,
     StagePlacementPlanner,
     build_stage_placement_plan,
-    resolve_same_gpu_stream_targets,
+    resolve_gpu_stage_names,
     resolve_stage_gpu_ids,
+)
+from sglang_omni.config.process_overrides import (
+    apply_stage_process_overrides,
+    parse_stage_process_assignment,
 )
 from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.config.schema import (
+    AudioChunkingConfig,
+    CommConfig,
     EndpointsConfig,
     ParallelismConfig,
     PipelineConfig,
     PlacementConfig,
-    RelayConfig,
     SGLangServerArgsConfig,
     StageConfig,
     StageResourceConfig,
@@ -36,12 +41,15 @@ __all__ = [
     "StagePlacementPlan",
     "StagePlacementPlanner",
     "build_stage_placement_plan",
-    "resolve_same_gpu_stream_targets",
+    "resolve_gpu_stage_names",
     "resolve_stage_gpu_ids",
+    "apply_stage_process_overrides",
+    "parse_stage_process_assignment",
     "resolve_stage_factory_args",
     "ProcessGroupPlacement",
     "ProcessTopologyPlan",
     "build_process_topology_plan",
+    "AudioChunkingConfig",
     "PipelineConfig",
     "StageConfig",
     "ParallelismConfig",
@@ -49,6 +57,6 @@ __all__ = [
     "SGLangServerArgsConfig",
     "StageRuntimeConfig",
     "PlacementConfig",
-    "RelayConfig",
+    "CommConfig",
     "EndpointsConfig",
 ]

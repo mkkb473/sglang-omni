@@ -65,6 +65,7 @@ The Docker image installs `ffmpeg`.
 benchmark_tts_serving.py       # entry point under benchmarks/eval/
 spec.py                        # spec schema and load-stage defaults
 scenarios.py                   # deterministic scenario matrix
+text_corpus.py                 # pinned target-text corpus loading
 http_client.py                 # HTTP request dispatch
 sdk_client.py                  # OpenAI SDK compatibility path
 ws_client.py                   # WebSocket speech-stream path
@@ -104,7 +105,7 @@ Common `params` fields:
 | `speaker_max_uploaded` | Expected server-side uploaded-speaker cap. |
 | `voice_cache_pressure_voice_count` | Number of unique uploaded voices for cache-pressure stages. |
 | `voice_speaker_cap_count` | Upload-attempt budget for speaker-cap stages. |
-| `file_ref_audio` | Optional `file://` reference audio URI sent to the target service. Required for full speech reference coverage. The target service must be launched with an allowed-local-media path that contains this file. |
+| `file_ref_audio` | Optional file URI sent to the target service. Required for full speech reference coverage. The target service must be launched with an allowed-local-media path that contains this file. |
 | `file_ref_text` | Optional transcript for `file_ref_audio`. Defaults to the SeedTTS reference text. |
 
 Load-stage fields:
@@ -112,14 +113,22 @@ Load-stage fields:
 | Field | Description |
 |-------|-------------|
 | `id` | Stable stage id used in scenario ids and artifacts. |
-| `mode` | `closed_loop`, `open_loop`, `ramp`, `burst`, or `soak`. |
-| `request_count` | Number of scheduled scenarios for the stage. |
+| `mode` | `closed_loop`, `open_loop`, `ramp`, `burst`, `soak`, or `scheduled`. |
+| `request_count` | Number of scenarios for non-`scheduled` stages. |
 | `max_concurrency` | Maximum in-flight requests for the stage. |
 | `request_rate` | Requests per second for `open_loop` and `ramp`. Do not set this for `soak` because it is derived from `request_count / duration_s`. |
 | `start_request_rate` | Initial requests per second for `ramp`. |
 | `duration_s` | Wall-clock duration for `soak`. |
+| `text_corpus` | Target-text corpus for supported workloads in a `scheduled` stage. `seedtts-en` allocates deterministic, non-overlapping texts from pinned SeedTTS English metadata. |
 | `arrival_distribution` | `deterministic` or `poisson`. |
 | `enabled_endpoints` | Optional per-stage endpoint override. |
+| `coverage_schedule` | Start and end offsets used to spread required contract scenarios across a `scheduled` stage. |
+| `workload_schedules` | Per-workload background and collision offsets for a `scheduled` stage. These offsets are the arrival authority, so rate, duration, distribution, and request-count fields are not accepted with this mode. |
+
+Scheduled offsets must be strictly increasing. Every collision offset must
+contain exactly one request from every configured workload, and background or
+coverage requests cannot use the same offset. The report validates both this
+membership and a common client-observed in-flight interval for each cohort.
 
 ## Endpoint Contracts
 
@@ -130,7 +139,7 @@ Load-stage fields:
 | `speech` | `POST /v1/audio/speech` with response formats, task types, language handling, speed bounds, reference audio, SDK compatibility, and malformed-request classification. |
 | `speech_stream` | `POST /v1/audio/speech` with raw PCM streaming and streaming error cases. |
 | `batch` | `POST /v1/audio/speech/batch` with 1-32 item batches, per-item overrides, item-level success/error records, and oversized batch rejection. |
-| `voices` | `GET`, `POST`, and `DELETE /v1/audio/voices` with upload formats, metadata, overwrite, delete, speaker-cap, cleanup, race, and cache-pressure behavior. |
+| `voices` | `GET`, `POST`, and `DELETE /v1/audio/voices` with upload formats, metadata, overwrite, delete, named voice reuse through speech and batch synthesis, speaker-cap, cleanup, race, and cache-pressure behavior. |
 | `websocket` | `/v1/audio/speech/stream` with session configuration, incremental text input, binary audio frames, event ordering, client disconnect, malformed JSON, and missing-config errors. |
 
 Voice cache-pressure scenarios require `GET /v1/audio/voices` to expose a
@@ -157,9 +166,10 @@ Malformed HTTP requests must return a structured JSON error body:
 }
 ```
 
-Missing resources must use the same shape with `type: "NotFoundError"` and
-`code: 404`. The missing-voice `DELETE /v1/audio/voices/{name}` contract is a
-voice-management response instead of the generic error envelope:
+Missing voice-management resources use the same shape with `type:
+"NotFoundError"` and `code: 404`. The missing-voice
+`DELETE /v1/audio/voices/{name}` contract is a voice-management response
+instead of the generic error envelope:
 
 ```json
 {
@@ -183,9 +193,11 @@ python -m benchmarks.eval.benchmark_tts_serving \
   --out results/tts_serving/stress
 ```
 
-The example spec uses `http://127.0.0.1:8000` and the Higgs TTS model id.
-Edit `base_url`, `model_name`, and `auth.api_key_env` for a different target or
-authenticated deployment.
+The checked-in spec targets a Higgs TTS service through the `base_url` and
+`model_name` fields in `examples/stress.json`. It also sends a reference clip
+from `docs/_static/audio`, so launch the target service from the repo root with
+`--allowed-local-media-path docs/_static/audio`. Update the spec fields, and
+`auth.api_key_env` when needed, for a different target.
 
 ## Docker
 
@@ -197,6 +209,9 @@ docker build -f benchmarks/tts_serving/Dockerfile \
 ```
 
 Run the image with a spec mounted at the contract path:
+
+Specs using `text_corpus: seedtts-en` download the pinned SeedTTS metadata to
+the container's temporary Hugging Face cache on first use.
 
 ```bash
 docker run --rm \
@@ -221,16 +236,16 @@ The matrix is deterministic for a given spec seed. It covers:
 - malformed speech requests that must return the structured error envelope
 - multilingual and adversarial text payloads
 - batch speech creation and item-level result validation
-- uploaded-voice list, upload, overwrite, delete, metadata, speaker-cap, and
-  upload/delete race contracts
+- uploaded-voice list, upload, overwrite, delete, metadata, named speech and
+  batch reuse, speaker-cap, and upload/delete race contracts
 - voice cache pressure traffic with observable cache counters
 - WebSocket speech-stream setup, event order, audio events, and error cases
 
 Voice scenarios are stateful. Successful standalone uploads verify uploaded
 metadata with `GET /v1/audio/voices`, delete the created voice, and list again
-to prove cleanup. Lifecycle delete also requires a structured 404 when a
-deleted voice is used for synthesis. Repeated runs should not consume
-persistent speaker slots or change later baselines.
+to prove cleanup. Lifecycle delete also verifies that using the deleted voice
+for synthesis returns a structured `400 BadRequestError`. Repeated runs should
+not consume persistent speaker slots or change later baselines.
 
 Compressed response formats are decoded through `ffmpeg` before validation.
 The benchmark checks decoded PCM duration and non-zero signal so container
@@ -242,18 +257,19 @@ headers or placeholder bytes cannot pass as generated audio.
 
 | Stage | Purpose |
 |-------|---------|
-| `closed-1` | Serial baseline that isolates contract failures from concurrency effects. |
-| `closed-16` | Moderate closed-loop concurrency. |
-| `ramp-128` | Poisson ramp from low request rate to high request rate. |
-| `soak-300s` | Sustained load over a fixed duration. |
-| `ws-burst-512` | WebSocket-only burst pressure. |
+| `mixed-production` | Deterministic mixed REST, streaming REST, WebSocket, batch-32, and long-prefill traffic over 300 seconds. |
 | `voice-cache-pressure` | Uploaded-voice cache pressure below the speaker cap. |
 | `voice-speaker-cap` | State-aware speaker-cap validation. |
-| `mixed-burst-512` | Full-endpoint burst with `request_count=512` and `max_concurrency=512`. |
 
-The mixed burst intentionally matches request count and concurrency so the
-client can emit the full burst without creating artificial
-`load_generator_saturated` records.
+The mixed stage schedules 50 normal speech requests, 50 streaming REST
+requests, 50 normal WebSocket requests, 40 audio-streaming WebSocket requests,
+20 batch-32 requests, and 20 long-prefill requests. Every 15 seconds, one
+request from each workload starts as an atomic six-way cohort. Background
+arrivals and 102 required API-coverage requests run between those cohorts, so
+the measured workloads contend with valid and expected-error serving traffic.
+Coverage traffic is counted explicitly but excluded from per-workload
+percentiles. Corpus-backed requests consume globally distinct target texts;
+each batch item also receives its own text, avoiding exact-prompt cache replay.
 
 Speaker-cap stages list existing uploaded voices first, upload only the names
 needed to reach `speaker_max_uploaded`, and require the first overflow upload
@@ -283,7 +299,11 @@ logs/harness.log      # load-stage execution notes
 | `harness_status` | Whether the harness ran successfully. |
 | `overall.coverage_contract_valid` | Whether required scenario coverage was achieved. |
 | `overall.load_generation_valid` | Whether the client emitted the intended load without saturation or excessive lag. |
+| `overall.mixed_arrival_valid` | Whether scheduled workload counts and collision evidence passed. |
 | `metrics.status_counts` | Count of `ok`, protocol failures, unsupported contracts, and load-generator failures. |
 | `metrics.endpoint_mix` | Executed scenario count by endpoint family. |
+| `metrics.by_stage` | Operational metrics across all successful traffic in each stage, including coverage traffic. |
+| `metrics.by_stage_and_workload` | Performance metrics for each workload within a load stage. |
+| `metrics.mixed_arrival` | Workload counts, coverage counts, and per-collision overlap evidence. |
 | `unsupported_contracts` | Enabled API contracts that were missing or unsupported. |
 | `coverage_failures` | Coverage requirements that traffic alone could not prove. |

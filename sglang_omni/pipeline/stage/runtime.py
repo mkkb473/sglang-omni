@@ -15,12 +15,16 @@ import os
 import queue as _queue_mod
 import threading
 from contextlib import suppress
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 
-from sglang_omni.pipeline import relay_io
+import torch
+
+from sglang_omni.comm import stage_io
+from sglang_omni.comm.data_ref import DataKind, DataRef
+from sglang_omni.comm.engine import CommEngine
+from sglang_omni.comm.router import CommRouter
 from sglang_omni.pipeline.stage.input import DirectInput, InputHandler
 from sglang_omni.pipeline.stage.stream_queue import StreamItem, StreamQueue
-from sglang_omni.pipeline.tensor_ref import TensorRefPolicy, tensor_refs_enabled
 from sglang_omni.pipeline.tp_control import TPLeaderFanout, TPWorkMessage
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
@@ -31,6 +35,7 @@ from sglang_omni.proto import (
     AdminResult,
     AdminResultMessage,
     CompleteMessage,
+    DataAckMessage,
     DataReadyMessage,
     ProfilerStartMessage,
     ProfilerStopMessage,
@@ -40,13 +45,19 @@ from sglang_omni.proto import (
     StreamMessage,
     SubmitMessage,
 )
-from sglang_omni.relay.base import Relay, create_relay
+from sglang_omni.relay.base import Relay
 from sglang_omni.scheduling.messages import IncomingMessage
 
 logger = logging.getLogger(__name__)
 
+_SCHEDULER_THREAD_JOIN_TIMEOUT_S = 5.0
+
 GetNextFn = Callable[[str, Any], str | list[str] | None]
 GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
+
+
+def _error_text(exc: BaseException) -> str:
+    return str(exc) or type(exc).__name__
 
 
 class Stage:
@@ -74,17 +85,24 @@ class Stage:
         gpu_id: int | None,
         endpoints: dict[str, str],
         control_plane: Any,
+        rank_endpoints: dict[str, tuple[str, ...]] | None = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        placement_gpu_id: int | None = None,
         input_handler: InputHandler | None = None,
         relay: Relay | None = None,
-        relay_config: dict[str, Any] | None = None,
+        comm_config: dict[str, Any] | None = None,
         scheduler: Any = None,
         project_payload: dict[str, Callable[[Any], Any]] | None = None,
         stream_targets: list[str] | None = None,
         get_stream_done_targets: GetStreamDoneTargetsFn | None = None,
-        same_gpu_targets: set[str] | None = None,
+        gpu_stage_names: set[str] | None = None,
+        stage_gpu_ids: dict[str, tuple[int, ...]] | None = None,
+        remote_stage_names: set[str] | None = None,
         same_process_targets: set[str] | None = None,
         local_dispatcher: Any | None = None,
         can_accept_stream_before_payload: bool = False,
+        disable_direct_cuda_ipc_payload: bool = False,
         tp_fanout: TPLeaderFanout | None = None,
         is_terminal: bool = False,
     ):
@@ -99,51 +117,42 @@ class Stage:
         self._project_payload = project_payload or {}
         self._stream_targets = stream_targets or []
         self.get_stream_done_targets = get_stream_done_targets
-        self._same_gpu_targets = same_gpu_targets or set()
         self._same_process_targets = same_process_targets or set()
         self._local_dispatcher = local_dispatcher
         self._can_accept_stream_before_payload = can_accept_stream_before_payload
+        self._disable_direct_cuda_ipc_payload = disable_direct_cuda_ipc_payload
         self._tp_fanout = tp_fanout
         self._is_terminal = is_terminal
         self._owns_external_io = role in {"single", "leader"}
 
-        # --- Relay ---
-        if relay is not None:
-            self.relay = relay
-        else:
-            config = relay_config or {}
-            engine_id = config.get("worker_id", f"{name}_relay")
-            relay_type = config.get("relay_type", "nixl").lower()
-            gpu_id = config.get("gpu_id")
-            if gpu_id is not None:
-                device = f"cuda:{gpu_id}"
-            else:
-                device = "cpu"
-                if relay_type == "nccl":
-                    device = "cuda"
-            self.relay = create_relay(
-                relay_type,
-                engine_id=engine_id,
-                slot_size_mb=config.get("slot_size_mb", 64),
-                credits=config.get("credits", 2),
-                device=device,
-                rank=config.get("rank"),
-                world_size=config.get("world_size"),
-                send_to_ranks=config.get("send_to_ranks", []),
-                recv_from_ranks=config.get("recv_from_ranks", []),
-            )
+        self._comm = CommEngine(
+            CommRouter(
+                stage_name=name,
+                gpu_id=self.gpu_id,
+                placement_gpu_id=placement_gpu_id,
+                same_process_targets=self._same_process_targets,
+                gpu_stage_names=gpu_stage_names or set(),
+                stage_gpu_ids=stage_gpu_ids,
+                remote_stage_names=remote_stage_names or set(),
+                comm_config=comm_config or {},
+                injected_relay=relay,
+            ),
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            rank_endpoints=rank_endpoints,
+            task_done_callback=self._on_background_task_done,
+        )
 
-        # --- State ---
         self._running = False
         self._aborted: set[str] = set()
         self._active_requests: set[str] = set()
         self._stream_queue: StreamQueue | None = None
         self._stream_chunk_counters: dict[tuple[str, str], int] = {}
-        # Per-request: did we already emit the first stream-chunk event?
         self._first_stream_chunk_seen: set[str] = set()
         self._local_stream_targets: dict[str, set[str]] = {}
         self._nonlocal_stream_targets: dict[str, set[str]] = {}
-        self._unresolved_tensor_refs: dict[str, dict[str, Any]] = {}
+        self._receive_tasks: set[asyncio.Task] = set()
+        self._receive_lane_tails: dict[tuple[str, str], asyncio.Future[None]] = {}
         self._scheduler_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._scheduler_crash_error: BaseException | None = None
@@ -153,6 +162,7 @@ class Stage:
         if self._running:
             return
         await self.control_plane.start()
+        await self._comm.start()
         self._loop = asyncio.get_running_loop()
         self._running = True
 
@@ -167,7 +177,7 @@ class Stage:
                     if self.gpu_id is not None:
                         import torch
 
-                        torch.cuda.set_device(int(self.gpu_id))
+                        torch.get_device_module().set_device(int(self.gpu_id))
                         logger.info(
                             "Scheduler thread for stage %s set CUDA device to %s",
                             self.name,
@@ -195,13 +205,71 @@ class Stage:
 
     async def stop(self) -> None:
         self._running = False
+        cleanup_error: Exception | None = None
+
+        def _record_cleanup_error(component: str, exc: Exception) -> None:
+            nonlocal cleanup_error
+            logger.warning(
+                "Stage %s %s cleanup failed: %s",
+                self.name,
+                component,
+                exc,
+                exc_info=True,
+            )
+            if cleanup_error is None:
+                cleanup_error = exc
+
+        receive_tasks = list(self._receive_tasks)
+        for task in receive_tasks:
+            task.cancel()
+        await asyncio.gather(*receive_tasks, return_exceptions=True)
+        self._receive_tasks.clear()
+        self._receive_lane_tails.clear()
         if self.scheduler is not None:
-            self.scheduler.stop()
-        self.control_plane.close()
+            try:
+                self.scheduler.stop()
+            except Exception as exc:
+                _record_cleanup_error("scheduler", exc)
+            # Note: (Jiaxin Deng) the scheduler thread emits its terminal
+            # model-path events from its own finally, and the MPS validation
+            # stage reads those files right after stop() returns, so wait for
+            # the thread instead of letting a daemon thread be reclaimed at
+            # process exit. A slow thread is logged, not fatal: shutdown
+            # correctness must not start depending on this timeout.
+            scheduler_thread = self._scheduler_thread
+            if scheduler_thread is not None:
+                try:
+                    await asyncio.to_thread(
+                        scheduler_thread.join,
+                        _SCHEDULER_THREAD_JOIN_TIMEOUT_S,
+                    )
+                except Exception as exc:
+                    _record_cleanup_error("scheduler thread", exc)
+                else:
+                    if scheduler_thread.is_alive():
+                        logger.warning(
+                            "Stage %s scheduler thread did not stop within %gs",
+                            self.name,
+                            _SCHEDULER_THREAD_JOIN_TIMEOUT_S,
+                        )
+                    else:
+                        self._scheduler_thread = None
+        try:
+            self.control_plane.close()
+        except Exception as exc:
+            _record_cleanup_error("control plane", exc)
         if self._tp_fanout is not None:
-            self._tp_fanout.close()
-        self.relay.close()
+            try:
+                self._tp_fanout.close()
+            except Exception as exc:
+                _record_cleanup_error("TP fanout", exc)
+        try:
+            await self._comm.close()
+        except Exception as exc:
+            _record_cleanup_error("comm", exc)
         logger.info("Stage %s stopped", self.name)
+        if cleanup_error is not None:
+            raise RuntimeError(f"Stage {self.name} cleanup failed") from cleanup_error
 
     async def run(self) -> None:
         await self.start()
@@ -261,19 +329,70 @@ class Stage:
     async def _handle_message(self, msg: Any) -> None:
         if isinstance(msg, SubmitMessage):
             await self._on_submit(msg)
+        elif isinstance(msg, DataAckMessage):
+            self._comm.ack_transfer(msg)
         elif isinstance(msg, DataReadyMessage):
-            if msg.is_done or msg.error:
-                await self._on_stream_signal(msg)
-            elif msg.chunk_id is not None:
-                await self._on_stream_chunk(msg)
-            else:
-                await self._on_data_ready(msg)
+            self._schedule_receive_task(msg)
         elif isinstance(msg, ProfilerStartMessage):
             self._on_profiler_start(msg)
         elif isinstance(msg, ProfilerStopMessage):
             self._on_profiler_stop(msg)
         elif isinstance(msg, AdminMessage):
             await self._on_admin(msg)
+
+    def _schedule_receive_task(
+        self,
+        msg: DataReadyMessage,
+    ) -> None:
+        if msg.is_done or msg.error is not None:
+            handler = self._on_stream_signal
+            label = f"stream signal {msg.request_id}:{msg.from_stage}"
+        elif msg.chunk_id is not None:
+            handler = self._on_stream_chunk
+            label = f"stream chunk {msg.request_id}:{msg.from_stage}:{msg.chunk_id}"
+        else:
+            handler = self._on_data_ready
+            label = f"data {msg.request_id}:{msg.from_stage}"
+
+        lane = (msg.request_id, msg.from_stage)
+        predecessor = self._receive_lane_tails.get(lane)
+        completion = asyncio.get_running_loop().create_future()
+        self._receive_lane_tails[lane] = completion
+        task = asyncio.create_task(
+            self._run_receive_task(
+                handler(msg, predecessor),
+                lane,
+                predecessor,
+                completion,
+            )
+        )
+        self._receive_tasks.add(task)
+        task.add_done_callback(self._receive_tasks.discard)
+        task.add_done_callback(lambda done: self._on_background_task_done(done, label))
+
+    async def _run_receive_task(
+        self,
+        coro: Awaitable[None],
+        lane: tuple[str, str],
+        predecessor: asyncio.Future[None] | None,
+        completion: asyncio.Future[None],
+    ) -> None:
+        try:
+            await coro
+        finally:
+            if predecessor is not None:
+                await predecessor
+            if not completion.done():
+                completion.set_result(None)
+            if self._receive_lane_tails.get(lane) is completion:
+                self._receive_lane_tails.pop(lane, None)
+
+    @staticmethod
+    async def _wait_for_receive_predecessor(
+        predecessor: asyncio.Future[None] | None,
+    ) -> None:
+        if predecessor is not None:
+            await predecessor
 
     async def _on_submit(self, msg: SubmitMessage) -> None:
         request_id = msg.request_id
@@ -292,29 +411,58 @@ class Stage:
         payload = msg.data  # StagePayload from coordinator
         await self._execute(payload)
 
-    async def _on_data_ready(self, msg: DataReadyMessage) -> None:
+    async def _on_data_ready(
+        self,
+        msg: DataReadyMessage,
+        predecessor: asyncio.Future[None] | None = None,
+    ) -> None:
         request_id = msg.request_id
         if request_id in self._aborted:
-            await self._discard_payload_data(msg)
+            await self._discard_data(msg)
             return
-        self._active_requests.add(request_id)
-        if self._stream_queue is not None and not self._stream_queue.has(request_id):
-            self._stream_queue.open(request_id)
 
-        # Read payload from relay
+        if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
+            try:
+                payload = stage_io.deserialize_direct_cuda_ipc_payload(msg.data_ref)
+            except Exception as exc:
+                logger.exception(
+                    "Stage %s: direct IPC payload deserialize failed for %s",
+                    self.name,
+                    request_id,
+                )
+                await self._wait_for_receive_predecessor(predecessor)
+                await self._send_failure(
+                    request_id, f"direct IPC payload deserialize failed: {exc}"
+                )
+                return
+            await self._wait_for_receive_predecessor(predecessor)
+            await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
+            return
+
+        data_ref = self._data_ref_from_message(msg)
+        relay = self._comm.relay(data_ref.transport)
         try:
-            payload = await relay_io.read_payload(
-                self.relay, request_id, msg.shm_metadata
+            payload = await self._comm.read_data(
+                relay=relay,
+                request_id=request_id,
+                data_ref=data_ref,
             )
         except Exception as exc:
             logger.exception(
                 "Stage %s: relay read failed for %s", self.name, request_id
             )
-            self.relay.cleanup(request_id)
+            await self._send_data_ack(
+                msg, data_ref, success=False, error=_error_text(exc)
+            )
+            self._comm.cleanup(request_id)
+            await self._wait_for_receive_predecessor(predecessor)
             await self._send_failure(request_id, f"relay read failed: {exc}")
             return
+        await self._send_data_ack(msg, data_ref, success=True)
 
-        await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
+        await self._wait_for_receive_predecessor(predecessor)
+        if payload is not None:
+            await self._receive_payload_from_stage(request_id, msg.from_stage, payload)
 
     async def receive_local_payload(
         self,
@@ -370,17 +518,11 @@ class Stage:
         payload: Any,
     ) -> None:
         if request_id in self._aborted:
-            self._release_payload_tensor_refs(payload)
             return
         self._active_requests.add(request_id)
         if self._stream_queue is not None and not self._stream_queue.has(request_id):
             self._stream_queue.open(request_id)
 
-        if request_id in self._aborted:
-            self._release_payload_tensor_refs(payload)
-            return
-
-        self._remember_payload_tensor_refs(request_id, payload)
         _emit_event(
             request_id=request_id,
             stage=self.name,
@@ -397,28 +539,41 @@ class Stage:
             )
             await self._execute(merged)
 
-    async def _on_stream_chunk(self, msg: DataReadyMessage) -> None:
+    async def _on_stream_chunk(
+        self,
+        msg: DataReadyMessage,
+        predecessor: asyncio.Future[None] | None = None,
+    ) -> None:
         request_id = msg.request_id
         if request_id in self._aborted:
             await self._discard_stream_chunk_data(msg)
             return
         self._active_requests.add(request_id)
 
-        # Same-GPU CUDA IPC
-        if isinstance(msg.shm_metadata, dict) and msg.shm_metadata.get("_ipc"):
+        if stage_io.is_direct_cuda_ipc_stream_chunk_ref(msg.data_ref):
             try:
-                item = self._deserialize_ipc_chunk(msg)
+                data, metadata = stage_io.deserialize_direct_cuda_ipc_stream_chunk(
+                    msg.data_ref
+                )
             except Exception as exc:
                 logger.error(
-                    "Stage %s: IPC deserialize failed for %s: %s",
+                    "Stage %s: direct IPC deserialize failed for %s: %s",
                     self.name,
                     request_id,
                     exc,
                 )
+                await self._wait_for_receive_predecessor(predecessor)
                 await self._queue_stream_error(request_id, msg.from_stage, exc)
                 return
+            await self._wait_for_receive_predecessor(predecessor)
             if request_id in self._aborted:
                 return
+            item = StreamItem(
+                chunk_id=msg.chunk_id,
+                data=data,
+                from_stage=msg.from_stage,
+                metadata=metadata,
+            )
             self._emit_stream_chunk_received(
                 request_id=msg.request_id,
                 from_stage=msg.from_stage,
@@ -427,11 +582,13 @@ class Stage:
             await self._route_stream_item_or_fail(request_id, item)
             return
 
-        # Cross-GPU: relay
-        blob_key = f"{request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
+        data_ref = self._data_ref_from_message(msg)
+        relay = self._comm.relay(data_ref.transport)
         try:
-            data = await relay_io.read_blob(self.relay, blob_key, msg.shm_metadata)
-            metadata = await self._read_chunk_metadata(msg.shm_metadata, blob_key)
+            data, metadata = await self._comm.read_stream_chunk(
+                relay=relay,
+                data_ref=data_ref,
+            )
         except Exception as exc:
             logger.error(
                 "Stage %s: stream chunk read failed for %s: %s",
@@ -439,9 +596,15 @@ class Stage:
                 request_id,
                 exc,
             )
+            await self._send_data_ack(
+                msg, data_ref, success=False, error=_error_text(exc)
+            )
+            await self._wait_for_receive_predecessor(predecessor)
             await self._queue_stream_error(request_id, msg.from_stage, exc)
             return
+        await self._send_data_ack(msg, data_ref, success=True)
 
+        await self._wait_for_receive_predecessor(predecessor)
         if request_id in self._aborted:
             return
 
@@ -508,79 +671,106 @@ class Stage:
             self.scheduler.abort(request_id)
         await self._send_failure(request_id, str(error))
 
-    async def _read_chunk_metadata(
-        self, shm_metadata: dict, blob_key: str
-    ) -> dict | None:
-        metadata = {}
-        chunk_meta = (
-            shm_metadata.get("chunk_metadata")
-            if isinstance(shm_metadata, dict)
-            else None
-        )
-        if isinstance(chunk_meta, dict):
-            metadata.update(chunk_meta)
-        tensor_blobs = (
-            shm_metadata.get("chunk_metadata_tensors", {})
-            if isinstance(shm_metadata, dict)
-            else {}
-        )
-        if isinstance(tensor_blobs, dict):
-            tensor_dict = {}
-            for path, info in tensor_blobs.items():
-                if not isinstance(info, dict):
-                    continue
-                meta_blob_key = info.get("blob_key")
-                meta_metadata = info.get("relay_metadata")
-                if isinstance(meta_blob_key, str) and isinstance(meta_metadata, dict):
-                    tensor_dict[path] = await relay_io.read_blob(
-                        self.relay, meta_blob_key, meta_metadata
-                    )
-            if tensor_dict:
-                metadata = relay_io.restore_tensors(metadata, tensor_dict)
-        return metadata or None
+    def _data_ref_from_message(self, msg: DataReadyMessage) -> DataRef:
+        if msg.data_ref is None:
+            raise ValueError("data_ready message is missing transfer data_ref")
+        return DataRef.from_dict(msg.data_ref)
 
-    async def _discard_payload_data(self, msg: DataReadyMessage) -> None:
-        request_id = msg.request_id
-        payload = None
-        try:
-            payload = await relay_io.read_payload(
-                self.relay, request_id, msg.shm_metadata
+    async def _send_data_ack(
+        self,
+        msg: DataReadyMessage,
+        data_ref: DataRef,
+        *,
+        success: bool,
+        error: str | None = None,
+    ) -> None:
+        endpoint = self.endpoints.get(msg.from_stage)
+        if endpoint is None:
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for ack target "
+                f"{msg.from_stage!r}"
             )
-        except Exception:
+        await self.control_plane.send_to_stage(
+            msg.from_stage,
+            endpoint,
+            DataAckMessage(
+                request_id=msg.request_id,
+                from_stage=self.name,
+                to_stage=msg.from_stage,
+                object_id=data_ref.object_id,
+                success=success,
+                error=error,
+            ),
+        )
+
+    async def _discard_data(self, msg: DataReadyMessage) -> None:
+        if stage_io.is_direct_cuda_ipc_payload_ref(msg.data_ref):
+            imported = stage_io.deserialize_direct_cuda_ipc_payload(msg.data_ref)
+            del imported
+            return
+        request_id = msg.request_id
+        data_ref = self._data_ref_from_message(msg)
+        if data_ref.kind is DataKind.KV_PAGES:
+            error = RuntimeError(f"request {request_id!r} was aborted")
+            self._comm.cleanup(request_id)
+            await self._send_data_ack(
+                msg,
+                data_ref,
+                success=False,
+                error=_error_text(error),
+            )
+            return
+        relay = self._comm.relay(data_ref.transport)
+        try:
+            await self._comm.read_data(
+                relay=relay,
+                request_id=request_id,
+                data_ref=data_ref,
+            )
+        except Exception as exc:
             logger.debug(
                 "Stage %s: failed to drain aborted payload for %s",
                 self.name,
                 request_id,
                 exc_info=True,
             )
-            self.relay.cleanup(request_id)
-        finally:
-            relay_io.release_tensor_ref_blobs_from_metadata(
-                self.relay, msg.shm_metadata
+            await self._send_data_ack(
+                msg, data_ref, success=False, error=_error_text(exc)
             )
-            if payload is not None:
-                self._release_payload_tensor_refs(payload)
+            self._comm.cleanup(request_id)
+            return
+        await self._send_data_ack(msg, data_ref, success=True)
 
     async def _discard_stream_chunk_data(self, msg: DataReadyMessage) -> None:
-        if isinstance(msg.shm_metadata, dict) and msg.shm_metadata.get("_ipc"):
+        if stage_io.is_direct_cuda_ipc_stream_chunk_ref(msg.data_ref):
+            imported = stage_io.deserialize_direct_cuda_ipc_stream_chunk(msg.data_ref)
+            del imported
             return
         if msg.chunk_id is None:
-            return
-        blob_key = (
-            f"{msg.request_id}:stream:{msg.from_stage}:{msg.to_stage}:{msg.chunk_id}"
-        )
+            raise ValueError("stream chunk discard requires chunk_id")
+        data_ref = self._data_ref_from_message(msg)
+        relay = self._comm.relay(data_ref.transport)
         try:
-            await relay_io.read_blob(self.relay, blob_key, msg.shm_metadata)
-            await self._read_chunk_metadata(msg.shm_metadata, blob_key)
-        except Exception:
+            await self._comm.read_stream_chunk(relay=relay, data_ref=data_ref)
+        except Exception as exc:
             logger.debug(
                 "Stage %s: failed to drain aborted stream chunk for %s",
                 self.name,
                 msg.request_id,
                 exc_info=True,
             )
+            await self._send_data_ack(
+                msg, data_ref, success=False, error=_error_text(exc)
+            )
+            return
+        await self._send_data_ack(msg, data_ref, success=True)
 
-    async def _on_stream_signal(self, msg: DataReadyMessage) -> None:
+    async def _on_stream_signal(
+        self,
+        msg: DataReadyMessage,
+        predecessor: asyncio.Future[None] | None = None,
+    ) -> None:
+        await self._wait_for_receive_predecessor(predecessor)
         await self._receive_stream_signal(
             msg.request_id,
             msg.from_stage,
@@ -639,23 +829,6 @@ class Stage:
         self._stream_queue.open(request_id)
         return True
 
-    @staticmethod
-    def _deserialize_ipc_chunk(msg: DataReadyMessage) -> StreamItem:
-        import pickle as _pickle
-
-        ipc_meta = msg.shm_metadata
-        data = _pickle.loads(ipc_meta["tensor_bytes"])
-        metadata = {}
-        raw_meta = ipc_meta.get("metadata", {})
-        if isinstance(raw_meta, dict):
-            metadata = relay_io.deserialize_ipc_metadata(raw_meta)
-        return StreamItem(
-            chunk_id=msg.chunk_id,
-            data=data,
-            from_stage=msg.from_stage,
-            metadata=metadata or None,
-        )
-
     def _route_stream_item(self, request_id: str, item: StreamItem) -> None:
         self.scheduler.inbox.put(
             IncomingMessage(request_id=request_id, type="stream_chunk", data=item)
@@ -673,23 +846,9 @@ class Stage:
             and self._tp_fanout is not None
             and getattr(self.scheduler, "requires_tp_work_fanout", False)
         ):
-            # note (luojiaxuan): Fan out unresolved refs before materialization
-            # so followers receive small refs, not large CUDA
-            # tensors. TensorRef blobs are single-resolve
-            # because SHM get unlinks on read; do not enable
-            # refs for requires_tp_work_fanout=True consumers
-            # until blob reads are ref-counted/non-destructive.
             self._tp_fanout.fanout_work(payload)
-        payload_for_scheduler = payload
-        if tensor_refs_enabled():
-            payload_for_scheduler = await relay_io.materialize_payload_tensor_refs(
-                self.relay, payload, current_stage=self.name
-            )
-            self._remember_payload_tensor_refs(request_id, payload_for_scheduler)
         self.scheduler.inbox.put(
-            IncomingMessage(
-                request_id=request_id, type="new_request", data=payload_for_scheduler
-            )
+            IncomingMessage(request_id=request_id, type="new_request", data=payload)
         )
 
     async def _on_admin(self, msg: AdminMessage) -> None:
@@ -836,13 +995,17 @@ class Stage:
             elif out.type == "stream":
                 if out.target is None:
                     if self._stream_targets:
-                        for target in self._stream_targets:
-                            await self._send_stream_to_target(
-                                out.request_id,
-                                out.data,
-                                target,
-                                out.metadata,
+                        await asyncio.gather(
+                            *(
+                                self._send_stream_to_target(
+                                    out.request_id,
+                                    out.data,
+                                    target,
+                                    out.metadata,
+                                )
+                                for target in self._stream_targets
                             )
+                        )
                     else:
                         await self._send_stream_to_coordinator(
                             out.request_id,
@@ -916,7 +1079,7 @@ class Stage:
                     request_id=request_id,
                     from_stage=self.name,
                     success=True,
-                    result=result.data,
+                    result=result.data if isinstance(result, StagePayload) else result,
                 )
             )
         else:
@@ -957,8 +1120,9 @@ class Stage:
             )
         endpoint = self.endpoints.get(target)
         if endpoint is None:
-            logger.warning("Stage %s: no endpoint for %s", self.name, target)
-            return
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for target {target!r}"
+            )
         projector = self._project_payload.get(target)
         projected_payload = projector(payload) if projector is not None else payload
         use_local_object = allow_local_object or (
@@ -1003,39 +1167,57 @@ class Stage:
             )
             return
 
-        tensor_ref_policy = TensorRefPolicy.from_env(
-            from_stage=self.name, to_stage=target
+        can_use_direct_cuda_ipc = self._comm.router.can_use_direct_cuda_ipc(target)
+        if (
+            not self._disable_direct_cuda_ipc_payload
+            and can_use_direct_cuda_ipc
+            and stage_io.payload_has_cuda_tensor(projected_payload)
+        ):
+            try:
+                direct_ref = stage_io.serialize_direct_cuda_ipc_payload(
+                    projected_payload
+                )
+            except RuntimeError as exc:
+                if "received from another process" not in str(exc):
+                    raise
+            else:
+                await self.control_plane.send_to_stage(
+                    target,
+                    endpoint,
+                    DataReadyMessage(
+                        request_id=request_id,
+                        from_stage=self.name,
+                        to_stage=target,
+                        data_ref=direct_ref,
+                    ),
+                )
+                _emit_event(
+                    request_id=request_id,
+                    stage=self.name,
+                    event_name="stage_hop_sent",
+                    metadata={"to_stage": target, "transport": "torch_cuda_ipc"},
+                )
+                return
+
+        transport_kind, relay = self._comm.router.relay_for_payload(
+            target, projected_payload
         )
-        metadata, op = await relay_io.write_payload(
-            self.relay,
-            request_id,
-            projected_payload,
-            from_stage=self.name,
-            to_stage=target,
-            tensor_ref_policy=tensor_ref_policy,
-        )
-        msg = DataReadyMessage(
+        await self._comm.send_payload(
+            relay=relay,
+            control_plane=self.control_plane,
             request_id=request_id,
+            payload=projected_payload,
+            transport=transport_kind,
             from_stage=self.name,
             to_stage=target,
-            shm_metadata=metadata,
+            target_endpoint=endpoint,
         )
-        hop_metadata: dict[str, Any] = {"to_stage": target}
-        tensor_ref_stats = metadata.get("tensor_ref_stats")
-        if tensor_ref_stats is not None:
-            hop_metadata.update(tensor_ref_stats)
         _emit_event(
             request_id=request_id,
             stage=self.name,
             event_name="stage_hop_sent",
-            metadata=hop_metadata,
+            metadata={"to_stage": target, "transport": transport_kind.value},
         )
-        try:
-            await self.control_plane.send_to_stage(target, endpoint, msg)
-            await op.wait_for_completion()
-        except Exception:
-            relay_io.release_tensor_ref_blobs_from_metadata(self.relay, metadata)
-            raise
 
     @staticmethod
     def _is_isolated_projected_payload(
@@ -1056,9 +1238,6 @@ class Stage:
                 "projected local-object dispatch requires projectors to return "
                 f"StagePayload, got {type(projected_payload).__name__}"
             )
-        # A fan-out edge may use process-local dispatch only when projection
-        # gives the target its own mutable payload/data containers. Tensor leaves
-        # inside those containers may still be shared intentionally.
         if projected_payload.data is original_payload.data:
             return False
         return not Stage._shares_mutable_container(
@@ -1144,7 +1323,10 @@ class Stage:
             return
         endpoint = self.endpoints.get(target)
         if endpoint is None:
-            return
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for stream target "
+                f"{target!r}"
+            )
         key = (request_id, target)
         chunk_id = self._stream_chunk_counters.get(key, 0)
         self._stream_chunk_counters[key] = chunk_id + 1
@@ -1159,17 +1341,18 @@ class Stage:
                 event_name="stage_first_stream_chunk_sent",
                 metadata={"to_stage": target, "modality": chunk_modality},
             )
-        _emit_event(
-            request_id=request_id,
-            stage=self.name,
-            event_name="stage_stream_chunk_sent",
-            metadata={
-                "to_stage": target,
-                "chunk_id": chunk_id,
-                "modality": chunk_modality,
-            },
-        )
         if target in self._same_process_targets:
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_stream_chunk_sent",
+                metadata={
+                    "to_stage": target,
+                    "chunk_id": chunk_id,
+                    "modality": chunk_modality,
+                    "transport": "local_object",
+                },
+            )
             if self._local_dispatcher is None:
                 raise RuntimeError(
                     f"Stage {self.name}: same-process stream target {target!r} "
@@ -1186,9 +1369,51 @@ class Stage:
             )
             return
         self._record_nonlocal_stream_target(request_id, target)
-        await relay_io.send_stream_chunk(
-            self.relay,
-            self.control_plane,
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(
+                "relay-backed stream chunks must be torch.Tensor, got "
+                f"{type(data).__name__}"
+            )
+        if data.is_cuda and self._comm.router.can_use_direct_cuda_ipc(target):
+            direct_ref = stage_io.serialize_direct_cuda_ipc_stream_chunk(data, metadata)
+            _emit_event(
+                request_id=request_id,
+                stage=self.name,
+                event_name="stage_stream_chunk_sent",
+                metadata={
+                    "to_stage": target,
+                    "chunk_id": chunk_id,
+                    "modality": chunk_modality,
+                    "transport": "torch_cuda_ipc",
+                },
+            )
+            await self.control_plane.send_to_stage(
+                target,
+                endpoint,
+                DataReadyMessage(
+                    request_id=request_id,
+                    from_stage=self.name,
+                    to_stage=target,
+                    data_ref=direct_ref,
+                    chunk_id=chunk_id,
+                ),
+            )
+            return
+        transport_kind, relay = self._comm.router.relay_for_stream(target, data)
+        _emit_event(
+            request_id=request_id,
+            stage=self.name,
+            event_name="stage_stream_chunk_sent",
+            metadata={
+                "to_stage": target,
+                "chunk_id": chunk_id,
+                "modality": chunk_modality,
+                "transport": transport_kind.value,
+            },
+        )
+        await self._comm.send_stream_chunk(
+            relay=relay,
+            control_plane=self.control_plane,
             request_id=request_id,
             data=data,
             target_stage=target,
@@ -1196,7 +1421,7 @@ class Stage:
             from_stage=self.name,
             chunk_id=chunk_id,
             metadata=metadata,
-            same_gpu_targets=self._same_gpu_targets,
+            transport=transport_kind,
         )
 
     async def _send_stream_signal_to_target(
@@ -1211,7 +1436,10 @@ class Stage:
             return
         endpoint = self.endpoints.get(target)
         if endpoint is None:
-            return
+            raise RuntimeError(
+                f"Stage {self.name}: no endpoint configured for stream target "
+                f"{target!r}"
+            )
         if target in self._same_process_targets:
             if self._local_dispatcher is None:
                 raise RuntimeError(
@@ -1228,7 +1456,7 @@ class Stage:
             )
             return
         self._record_nonlocal_stream_target(request_id, target)
-        await relay_io.send_stream_signal(
+        await stage_io.send_stream_signal(
             self.control_plane,
             request_id=request_id,
             target_stage=target,
@@ -1296,7 +1524,6 @@ class Stage:
     async def _send_failure(self, request_id: str, error: str) -> None:
         self._record_aborted_request_id(request_id)
         if not self._owns_external_io:
-            self._release_tracked_tensor_refs(request_id)
             self._clear_request_state(request_id)
             raise RuntimeError(f"Follower stage {self.name} failed: {error}")
         await self.control_plane.send_complete(
@@ -1307,7 +1534,6 @@ class Stage:
                 error=error,
             )
         )
-        self._release_tracked_tensor_refs(request_id)
         self._clear_request_state(request_id)
 
     def _clear_request_state(self, request_id: str) -> None:
@@ -1323,7 +1549,6 @@ class Stage:
         self._first_stream_chunk_seen.discard(request_id)
         self._local_stream_targets.pop(request_id, None)
         self._nonlocal_stream_targets.pop(request_id, None)
-        self._unresolved_tensor_refs.pop(request_id, None)
 
     async def _handle_scheduler_crash(self, exc: BaseException) -> None:
         if self._scheduler_crash_error is not None:
@@ -1343,7 +1568,7 @@ class Stage:
                 self.scheduler.abort(request_id)
             await self._send_failure(request_id, error)
             with suppress(Exception):
-                self.relay.cleanup(request_id)
+                self._comm.cleanup(request_id)
         self.control_plane.close()
 
     async def _abort_listener(self) -> None:
@@ -1369,25 +1594,9 @@ class Stage:
 
     def _on_abort(self, request_id: str) -> None:
         self._record_aborted_request_id(request_id)
-        self._release_tracked_tensor_refs(request_id)
-        self.relay.cleanup(request_id)
+        self._comm.cleanup(request_id)
         self._clear_request_state(request_id)
         self.scheduler.abort(request_id)
-
-    def _remember_payload_tensor_refs(self, request_id: str, payload: Any) -> None:
-        data = getattr(payload, "data", payload)
-        refs = relay_io.collect_tensor_refs(data)
-        if refs:
-            tracked = self._unresolved_tensor_refs.setdefault(request_id, {})
-            tracked.update({ref.blob_key: ref for ref in refs})
-
-    def _release_payload_tensor_refs(self, payload: Any) -> None:
-        data = getattr(payload, "data", payload)
-        relay_io.release_tensor_refs(self.relay, relay_io.collect_tensor_refs(data))
-
-    def _release_tracked_tensor_refs(self, request_id: str) -> None:
-        refs = list(self._unresolved_tensor_refs.pop(request_id, {}).values())
-        relay_io.release_tensor_refs(self.relay, refs)
 
     def _on_profiler_start(self, msg: ProfilerStartMessage) -> None:
         run_id = msg.run_id

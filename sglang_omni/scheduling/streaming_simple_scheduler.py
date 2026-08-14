@@ -41,6 +41,7 @@ class StreamingSimpleScheduler:
 
     _can_batch_stream_chunks: bool = False
     _stream_chunk_batch_max: int | None = None
+    _stream_chunk_batch_distinct_requests: bool = False
 
     def __init__(
         self,
@@ -273,6 +274,14 @@ class StreamingSimpleScheduler:
             if self._is_aborted(msg.request_id):
                 continue
             if msg.type != "new_request":
+                if (
+                    msg.type == "stream_done"
+                    and msg.request_id not in self._stream_payloads
+                ):
+                    # Note(Chenchen Hong): Done-before-payload only latches state,
+                    # so defer it and keep looking for terminal payloads that can batch.
+                    self._pending_messages.append(msg)
+                    continue
                 self._pending_messages.append(msg)
                 break
             try:
@@ -304,6 +313,11 @@ class StreamingSimpleScheduler:
         """Front-pushback of the first non-chunk message preserves arrival order; no blocking
         wait, so only already-queued chunks coalesce."""
         batch = [first_msg]
+        seen_request_ids = (
+            {first_msg.request_id}
+            if self._stream_chunk_batch_distinct_requests
+            else None
+        )
         cap = self._stream_chunk_batch_max or max(self._max_batch_size, 1)
         if cap <= 1:
             return batch
@@ -317,7 +331,12 @@ class StreamingSimpleScheduler:
                 break
             if self._is_aborted(msg.request_id):
                 continue
+            if seen_request_ids is not None and msg.request_id in seen_request_ids:
+                self._pending_messages.appendleft(msg)
+                break
             batch.append(msg)
+            if seen_request_ids is not None:
+                seen_request_ids.add(msg.request_id)
         return batch
 
     def _handle_new_request_batch(

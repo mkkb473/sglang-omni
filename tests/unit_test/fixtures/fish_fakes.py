@@ -45,6 +45,10 @@ def make_s2pro_payload(
 
 class FakeFishTokenizer:
     vocab_size = 512
+    eos_token_id = 99
+
+    def __len__(self) -> int:
+        return 640
 
     def __init__(self) -> None:
         self.additional_stop_token_ids: list[int] = []
@@ -100,20 +104,14 @@ class FakeFishReq:
         self,
         *,
         rid: str = "req-fish",
-        is_chunked: int = 0,
-        extend_input_len: int = 0,
+        inflight_middle_chunks: int = 0,
+        extend_len: int = 0,
         prefix_indices: list[int] | None = None,
-        decode_batch_idx: int = 0,
     ) -> None:
         self.rid = rid
-        self.is_chunked = is_chunked
-        self.extend_input_len = extend_input_len
+        self.inflight_middle_chunks = inflight_middle_chunks
+        self.extend_range = SimpleNamespace(length=extend_len)
         self.prefix_indices = prefix_indices or []
-        self.decode_batch_idx = decode_batch_idx
-        self.output_ids: list[int] = []
-
-    def finished(self) -> bool:
-        return False
 
 
 class FakeFishModel:

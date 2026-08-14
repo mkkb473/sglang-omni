@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -55,10 +56,12 @@ def disable_proxy() -> Generator[None, None, None]:
         os.environ.update(saved_env)
 
 
+PROXY_ENV_KEYS = {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}
+
+
 def no_proxy_env() -> dict[str, str]:
     """Return a copy of os.environ with proxy variables removed, for subprocess use."""
-    proxy_keys = {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}
-    return {k: v for k, v in os.environ.items() if k.lower() not in proxy_keys}
+    return {k: v for k, v in os.environ.items() if k.lower() not in PROXY_ENV_KEYS}
 
 
 def server_log_file(tmp_path_factory, prefix: str = "server_logs") -> Path | None:
@@ -90,11 +93,21 @@ def wait_for_gpu_memory_release(
     wait_timeout_seconds: int | None = None,
     poll_seconds: int | None = None,
 ) -> None:
-    """Kill orphan GPU processes and block until every GPU is below threshold."""
+    """Kill orphan GPU processes on this job's GPUs; wait until they are idle.
+
+    Requires CUDA_VISIBLE_DEVICES (physical ids) so concurrent calibration
+    groups cannot wipe each other. Single-tenant CI may omit it when
+    GITHUB_ACTIONS=true.
+    """
     if not GPU_CLEANUP_SCRIPT.exists():
         raise FileNotFoundError(f"GPU cleanup script missing: {GPU_CLEANUP_SCRIPT}")
 
     env = os.environ.copy()
+    if not env.get("CUDA_VISIBLE_DEVICES") and env.get("GITHUB_ACTIONS") != "true":
+        raise RuntimeError(
+            "wait_for_gpu_memory_release requires CUDA_VISIBLE_DEVICES "
+            "(physical GPU ids owned by this job) when not on GitHub Actions"
+        )
     env["OMNI_CI_GPU_MEMORY_CLEAN_THRESHOLD_MB"] = str(
         memory_threshold_mb
         if memory_threshold_mb is not None
@@ -111,6 +124,7 @@ def wait_for_gpu_memory_release(
 
     print(
         f"[gpu cleanup] running ensure_gpus_idle "
+        f"scope={env.get('CUDA_VISIBLE_DEVICES', 'ci-unscoped')} "
         f"(threshold={env['OMNI_CI_GPU_MEMORY_CLEAN_THRESHOLD_MB']} MiB)...",
         flush=True,
     )
@@ -164,9 +178,14 @@ def start_server_from_cmd(
     timeout: int = STARTUP_TIMEOUT,
     env: dict[str, str] | None = None,
     tee: bool = False,
+    strip_proxy: bool = False,
 ) -> subprocess.Popen:
     """Start a server from an arbitrary command and wait until healthy."""
     process_env = os.environ.copy()
+    if strip_proxy:
+        for key in list(process_env):
+            if key.lower() in PROXY_ENV_KEYS:
+                del process_env[key]
     if env is not None:
         process_env.update(env)
     if log_file is None:
@@ -230,12 +249,16 @@ def managed_omni_server(
     port: int,
     host: str,
     log_file: Path | None,
+    server_config: str | None = None,
     max_running_requests: int | None = None,
     cuda_graph_max_bs: int | None = None,
+    mem_fraction_static: float | None = None,
+    quantization: str | None = None,
     timeout: int = STARTUP_TIMEOUT,
     wait_for_gpu_release: bool = True,
 ) -> Iterator[None]:
     """Start an ``sglang_omni.cli serve`` process and clean it up on exit."""
+    _ensure_port_available(host, port)
     cmd = [
         sys.executable,
         "-m",
@@ -248,10 +271,16 @@ def managed_omni_server(
         "--host",
         host,
     ]
+    if server_config is not None:
+        cmd.extend(["--config", server_config])
     if max_running_requests is not None:
         cmd.extend(["--max-running-requests", str(max_running_requests)])
     if cuda_graph_max_bs is not None:
         cmd.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
+    if mem_fraction_static is not None:
+        cmd.extend(["--mem-fraction-static", str(mem_fraction_static)])
+    if quantization is not None:
+        cmd.extend(["--quantization", quantization])
     logger.info(f"Starting server: {' '.join(cmd)}")
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +292,17 @@ def managed_omni_server(
         stop_server(proc)
         if wait_for_gpu_release:
             wait_for_gpu_memory_release()
+
+
+def _ensure_port_available(host: str, port: int) -> None:
+    probe_host = "" if host in {"0.0.0.0", "::"} else host
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((probe_host, port))
+    except OSError as exc:
+        raise RuntimeError(
+            f"Port {port} is already in use on {host}; pass a free --port."
+        ) from exc
 
 
 def get_wav_duration(wav_bytes: bytes) -> float:

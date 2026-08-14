@@ -26,6 +26,7 @@ seedtts_testset/
 .pytest_cache/
 .coverage
 htmlcov/
+*.wav
 
 # Logs
 *.log
@@ -44,6 +45,11 @@ results/
 .tune-runs/
 .eval-runs/
 benchmarks/eval/*.edit.lock
-qwen3_asr_concurrency_results.json
+asr_seedtts_results.json
 .claude/*
 !.claude/skills/
+/core
+
+/task.md
+/test_minimax_music3.py
+/test_minimax_music3_acoustic.py

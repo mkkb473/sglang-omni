@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import multiprocessing
 import os
@@ -10,9 +11,9 @@ import queue
 import sys
 import time
 from collections.abc import Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Sequence
 
 from sglang_omni.config.runtime import resolve_factory_signature_args
 from sglang_omni.pipeline.control_plane import StageControlPlane
@@ -21,6 +22,7 @@ from sglang_omni.pipeline.stage.input import AggregatedInput, DirectInput
 from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.tp_control import TPFollowerControlPlane, TPLeaderFanout
+from sglang_omni.platforms import current_platform, get_platform_spec
 from sglang_omni.utils.gpu_compat import (
     apply_gpu_compat_env_defaults,
     get_gpu_compat_env_defaults,
@@ -48,6 +50,7 @@ class StageLaunchConfig:
     role: Literal["single", "leader", "follower"] = "single"
     tp_rank: int = 0
     tp_size: int = 1
+    placement_gpu_id: int | None = None
     gpu_id: int | None = None
     nccl_port: int | None = None
 
@@ -68,21 +71,27 @@ class StageLaunchConfig:
     merge_fn: str | None = None
     project_payload: dict[str, str] = field(default_factory=dict)
 
-    # Relay
-    relay_config: dict[str, Any] = field(default_factory=dict)
+    # Communication pool/options. Transport selection belongs to CommRouter.
+    comm_config: dict[str, Any] = field(default_factory=dict)
 
     # Endpoints
     recv_endpoint: str = ""
     coordinator_endpoint: str = ""
     abort_endpoint: str = ""
     stage_endpoints: dict[str, str] = field(default_factory=dict)
+    rank_endpoints: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     # Stream wiring
     stream_targets: list[str] = field(default_factory=list)
     stream_done_to_fn: str | None = None
-    same_gpu_targets: set[str] = field(default_factory=set)
+    # GPU-resident stage names (for the transport router to pick GPU vs host transport).
+    gpu_stage_names: set[str] = field(default_factory=set)
+    stage_gpu_ids: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    # Explicit cross-node stage names. These edges use Mooncake when present.
+    remote_stage_names: set[str] = field(default_factory=set)
     is_stream_receiver: bool = False
     can_accept_stream_before_payload: bool = False
+    disable_direct_cuda_ipc_payload: bool = False
 
     # Same-process full payload wiring
     same_process_targets: set[str] = field(default_factory=set)
@@ -136,7 +145,7 @@ def _get_worker_process_env(spec: StageWorkerProcessSpec) -> dict[str, str]:
             "stages; TP stages must own their OS process exclusively. "
             f"stage_specs={[s.stage_name for s in spec.stage_specs]}"
         )
-    return get_stage_process_env(tp_stages[0])
+    return current_platform.get_stage_process_env(tp_stages[0])
 
 
 @contextmanager
@@ -165,11 +174,8 @@ def _patched_spawn_env(spec: StageWorkerProcessSpec):
         **env_default_updates,
         **compat_env_defaults,
         **worker_process_env,
+        "SGLANG_OMNI_PLATFORM_SPEC": get_platform_spec(current_platform),
     }
-    if not updates:
-        yield
-        return
-
     backup = {key: os.environ.get(key) for key in updates}
     try:
         for key, value in updates.items():
@@ -371,12 +377,31 @@ def stage_process_main(
             _prepare_cuda_environment(stage_spec, log)
         apply_gpu_compat_env_defaults()
         _run_process(spec, ready_event, log)
-    except Exception:
+    except (KeyboardInterrupt, SystemExit):
+        _destroy_torch_distributed_process_group(log)
+        _reclaim_process_cuda_memory(
+            _stage_gpu_ids(spec.stage_specs),
+            log,
+            reason=f"stage process {spec.process_name} terminated during startup",
+        )
+        raise
+    except Exception as exc:
         import traceback
 
-        log.exception("Stage process %s failed", spec.process_name)
+        traceback_text = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        with suppress(Exception):
+            traceback.clear_frames(exc.__traceback__)
+        log.error("Stage process %s failed\n%s", spec.process_name, traceback_text)
+        _destroy_torch_distributed_process_group(log)
+        _reclaim_process_cuda_memory(
+            _stage_gpu_ids(spec.stage_specs),
+            log,
+            reason=f"stage process {spec.process_name} exit after failure",
+        )
         if startup_error_channel is not None:
-            startup_error_channel.put(traceback.format_exc())
+            startup_error_channel.put(traceback_text)
         sys.exit(1)
 
 
@@ -400,11 +425,7 @@ def _run_process(
       across them.
     """
     local_dispatcher = LocalStageDispatcher()
-    stages = [
-        _construct_stage(stage_spec, log, local_dispatcher=local_dispatcher)
-        for stage_spec in spec.stage_specs
-    ]
-    local_dispatcher.register_many(stages)
+    stages: list[Stage] = []
 
     async def _start_and_run():
         tasks: list[asyncio.Task] = []
@@ -428,7 +449,126 @@ def _run_process(
                 if stage._running:
                     await stage.stop()
 
-    asyncio.run(_start_and_run())
+    try:
+        for stage_spec in spec.stage_specs:
+            stages.append(
+                _construct_stage(
+                    stage_spec,
+                    log,
+                    local_dispatcher=local_dispatcher,
+                )
+            )
+        local_dispatcher.register_many(stages)
+        asyncio.run(_start_and_run())
+    except BaseException:
+        _cleanup_constructed_stages(
+            stages,
+            log,
+            reason=f"stage process {spec.process_name} failure",
+        )
+        raise
+
+
+def _cleanup_constructed_stages(
+    stages: list[Stage],
+    log: logging.Logger,
+    *,
+    reason: str,
+) -> None:
+    if stages:
+        log.warning(
+            "Cleaning up %d constructed stage(s) after %s",
+            len(stages),
+            reason,
+        )
+    for stage in reversed(stages):
+        try:
+            asyncio.run(stage.stop())
+        except Exception as exc:
+            log.warning(
+                "Stage %s cleanup failed after process failure: %s",
+                stage.name,
+                exc,
+                exc_info=True,
+            )
+        finally:
+            stage.scheduler = None
+
+
+def _stage_gpu_ids(stage_specs: Iterable[StageLaunchConfig]) -> list[int]:
+    return sorted(
+        {
+            int(stage_spec.gpu_id)
+            for stage_spec in stage_specs
+            if stage_spec.gpu_id is not None
+        }
+    )
+
+
+def _destroy_torch_distributed_process_group(log: logging.Logger) -> None:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            log.warning("Destroying torch.distributed process group after failure")
+            dist.destroy_process_group()
+    except Exception as exc:
+        log.warning(
+            "torch.distributed cleanup failed after stage process failure: %s",
+            exc,
+            exc_info=True,
+        )
+
+
+def _reclaim_process_cuda_memory(
+    gpu_ids: Iterable[int],
+    log: logging.Logger,
+    *,
+    reason: str,
+) -> None:
+    gpu_id_list = list(gpu_ids)
+    if not gpu_id_list:
+        return
+    gc.collect()
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        log.warning(
+            "Reclaiming CUDA memory after %s on gpu_ids=%s",
+            reason,
+            gpu_id_list,
+        )
+        for gpu_id in gpu_id_list:
+            try:
+                torch.cuda.set_device(int(gpu_id))
+                with suppress(Exception):
+                    torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                with suppress(Exception):
+                    torch.cuda.ipc_collect()
+            except Exception as exc:
+                log.warning(
+                    "CUDA memory reclaim failed for gpu_id=%s after %s: %s",
+                    gpu_id,
+                    reason,
+                    exc,
+                    exc_info=True,
+                )
+        gc.collect()
+        log.warning(
+            "CUDA memory reclaim complete after %s on gpu_ids=%s",
+            reason,
+            gpu_id_list,
+        )
+    except Exception as exc:
+        log.warning(
+            "CUDA memory reclaim skipped after %s: %s",
+            reason,
+            exc,
+            exc_info=True,
+        )
 
 
 def _construct_stage(
@@ -438,10 +578,8 @@ def _construct_stage(
 ) -> Stage:
     gpu_id = spec.gpu_id
     if gpu_id is not None:
-        import torch
-
-        torch.cuda.set_device(int(gpu_id))
-        log.info("Set current CUDA device to %s for stage %s", gpu_id, spec.stage_name)
+        current_platform.set_device(int(gpu_id))
+        log.info("Set current device to %s for stage %s", gpu_id, spec.stage_name)
 
     # --- Build scheduler via factory ---
     log.info(
@@ -602,18 +740,25 @@ def _construct_stage(
         role=spec.role,
         get_next=get_next,
         gpu_id=spec.gpu_id,
+        placement_gpu_id=spec.placement_gpu_id,
         endpoints=spec.stage_endpoints,
+        rank_endpoints=spec.rank_endpoints,
+        tp_rank=spec.tp_rank,
+        tp_size=spec.tp_size,
         control_plane=control_plane,
         input_handler=input_handler,
-        relay_config=spec.relay_config,
+        comm_config=spec.comm_config,
         scheduler=scheduler,
         project_payload=project_payload or None,
         stream_targets=spec.stream_targets or None,
         get_stream_done_targets=get_stream_done_targets,
-        same_gpu_targets=spec.same_gpu_targets or None,
+        gpu_stage_names=spec.gpu_stage_names or None,
+        stage_gpu_ids=spec.stage_gpu_ids or None,
+        remote_stage_names=spec.remote_stage_names or None,
         same_process_targets=spec.same_process_targets or None,
         local_dispatcher=local_dispatcher,
         can_accept_stream_before_payload=spec.can_accept_stream_before_payload,
+        disable_direct_cuda_ipc_payload=spec.disable_direct_cuda_ipc_payload,
         tp_fanout=tp_fanout,
         is_terminal=spec.is_terminal,
     )
@@ -645,36 +790,6 @@ def _construct_scheduler(
         return factory(**factory_args)
 
 
-def get_stage_process_env(
-    spec: StageLaunchConfig,
-    env: Mapping[str, str] | None = None,
-) -> dict[str, str]:
-    """Return per-process env overrides needed before TP child startup."""
-    if spec.tp_size <= 1:
-        return {}
-
-    source_env = env if env is not None else os.environ
-    original_visible = source_env.get("CUDA_VISIBLE_DEVICES")
-    if spec.gpu_id is None:
-        raise ValueError(f"tp stage {spec.stage_name!r} requires a GPU id")
-    if original_visible:
-        visible_devices = [item.strip() for item in original_visible.split(",")]
-        if spec.gpu_id >= len(visible_devices):
-            raise ValueError(
-                f"tp stage {spec.stage_name!r} assigned gpu_id={spec.gpu_id}, "
-                f"but CUDA_VISIBLE_DEVICES only exposes {visible_devices}"
-            )
-        mapped_gpu = visible_devices[spec.gpu_id]
-    else:
-        mapped_gpu = str(spec.gpu_id)
-
-    return {
-        "CUDA_VISIBLE_DEVICES": mapped_gpu,
-        "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS": "true",
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
-    }
-
-
 def _prepare_cuda_environment(
     spec: StageLaunchConfig,
     log: logging.Logger,
@@ -691,7 +806,7 @@ def _prepare_cuda_environment(
         )
         return
 
-    env_updates = get_stage_process_env(spec)
+    env_updates = current_platform.get_stage_process_env(spec)
     if not env_updates:
         return
 
@@ -709,11 +824,13 @@ def _prepare_cuda_environment(
 
 
 def _normalize_spec_gpu_id_to_local_device(spec: StageLaunchConfig) -> None:
+    if spec.placement_gpu_id is None:
+        spec.placement_gpu_id = spec.gpu_id
     spec.gpu_id = 0
     if "gpu_id" in spec.factory_arg_defaults:
         spec.factory_arg_defaults["gpu_id"] = 0
-    if "gpu_id" in spec.relay_config:
-        spec.relay_config["gpu_id"] = 0
+    if "gpu_id" in spec.comm_config:
+        spec.comm_config["gpu_id"] = 0
 
 
 def _process_name(spec: StageWorkerProcessSpec) -> str:

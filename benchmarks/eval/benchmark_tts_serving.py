@@ -25,6 +25,8 @@ import asyncio
 import os
 import random
 import time
+from collections.abc import Iterable
+from itertools import groupby
 from pathlib import Path
 
 import aiohttp
@@ -46,8 +48,8 @@ from benchmarks.tts_serving.ws_client import run_ws_scenario
 LOAD_GENERATOR_LAGGED_THRESHOLD_S = 1.0
 DEFAULT_SPEC_PATH = "/etc/benchmark/spec.json"
 DEFAULT_OUT_DIR = "/var/benchmark/out"
-SUMMARY_LINE_WIDTH = 72
-SUMMARY_LABEL_WIDTH = 30
+SUMMARY_LINE_WIDTH = 96
+SUMMARY_LABEL_WIDTH = 32
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -94,7 +96,7 @@ async def _run_stage(
     scenarios: list[Scenario],
     harness_log: list[str],
 ) -> list[ScenarioResult]:
-    if len(scenarios) > stage.request_count:
+    if stage.mode != "scheduled" and len(scenarios) > stage.request_count:
         harness_log.append(
             f"stage={stage.id} scheduled {len(scenarios)} scenarios although "
             f"request_count={stage.request_count}; required benchmark contracts "
@@ -159,7 +161,11 @@ async def _run_scheduled_stage(
     harness_log: list[str],
 ) -> list[ScenarioResult]:
     stage_start = time.perf_counter()
-    offsets = _planned_offsets(stage, len(scenarios), seed=spec.seed)
+    offsets = (
+        [_scheduled_offset(scenario) for scenario in scenarios]
+        if stage.mode == "scheduled"
+        else _planned_offsets(stage, len(scenarios), seed=spec.seed)
+    )
     active_requests = 0
     peak_inflight = 0
 
@@ -177,6 +183,8 @@ async def _run_scheduled_stage(
             planned_start=planned_start,
             actual_start=actual_start,
             generator_lag=max(0.0, actual_start - planned_start),
+            configured_offset=offset,
+            collision_epoch=scenario.collision_epoch_s,
         )
         return result
 
@@ -185,7 +193,18 @@ async def _run_scheduled_stage(
     results: list[ScenarioResult] = []
     peak_pending_tasks = 0
     scheduled_task_count = 0
-    for scenario, offset in zip(scenarios, offsets, strict=True):
+    arrivals = list(zip(scenarios, offsets, strict=True))
+    if stage.mode == "scheduled":
+        arrival_groups: Iterable[tuple[float, list[Scenario]]] = (
+            (offset, [scenario for scenario, _ in grouped_arrivals])
+            for offset, grouped_arrivals in groupby(
+                arrivals,
+                key=lambda item: item[1],
+            )
+        )
+    else:
+        arrival_groups = ((offset, [scenario]) for scenario, offset in arrivals)
+    for offset, group in arrival_groups:
         planned_start = stage_start + offset
         delay_s = planned_start - time.perf_counter()
         if delay_s > 0:
@@ -194,10 +213,10 @@ async def _run_scheduled_stage(
         if done:
             pending.difference_update(done)
             results.extend(_harvest_completed_tasks(done))
-        scheduled_task_count += 1
-        if active_requests >= stage.max_concurrency:
+        scheduled_task_count += len(group)
+        if active_requests + len(group) > stage.max_concurrency:
             actual_start = time.perf_counter()
-            results.append(
+            results.extend(
                 _load_generator_saturated_result(
                     scenario,
                     stage=stage,
@@ -205,12 +224,16 @@ async def _run_scheduled_stage(
                     actual_start=actual_start,
                     active_requests=active_requests,
                     generator_lag=max(0.0, actual_start - planned_start),
+                    configured_offset=offset,
                 )
+                for scenario in group
             )
             continue
-        active_requests += 1
+        active_requests += len(group)
         peak_inflight = max(peak_inflight, active_requests)
-        pending.add(asyncio.create_task(run_planned(scenario, offset)))
+        pending.update(
+            asyncio.create_task(run_planned(scenario, offset)) for scenario in group
+        )
         peak_pending_tasks = max(peak_pending_tasks, len(pending))
     if pending:
         results.extend(await _gather_pending_tasks(pending))
@@ -247,12 +270,14 @@ def _load_generator_saturated_result(
     actual_start: float,
     active_requests: int,
     generator_lag: float,
+    configured_offset: float,
 ) -> ScenarioResult:
     result = ScenarioResult(
         scenario_id=scenario.id,
         endpoint=scenario.endpoint,
         category=scenario.category,
         capability_key=scenario.capability_key,
+        workload=scenario.workload,
         expected_success=scenario.expect_success,
         response_format=str(scenario.payload.get("response_format", "")) or None,
         batch_size=scenario.planned_metadata.get("batch_size"),
@@ -274,6 +299,8 @@ def _load_generator_saturated_result(
         actual_start=actual_start,
         peak_inflight=active_requests,
         generator_lag=generator_lag,
+        configured_offset=configured_offset,
+        collision_epoch=scenario.collision_epoch_s,
     )
     return result
 
@@ -324,6 +351,7 @@ def _scenario_exception_result(scenario: Scenario, exc: Exception) -> ScenarioRe
         endpoint=scenario.endpoint,
         category=scenario.category,
         capability_key=scenario.capability_key,
+        workload=scenario.workload,
         expected_success=scenario.expect_success,
         response_format=str(scenario.payload.get("response_format", "")) or None,
         batch_size=scenario.planned_metadata.get("batch_size"),
@@ -359,16 +387,26 @@ def _attach_schedule_metadata(
     actual_start: float,
     peak_inflight: int | None = None,
     generator_lag: float | None = None,
+    configured_offset: float | None = None,
+    collision_epoch: float | None = None,
 ) -> None:
     result.stage_id = stage.id
     result.load_mode = stage.mode
     result.load_concurrency = stage.max_concurrency
     result.configured_max_concurrency = stage.max_concurrency
     result.peak_inflight = peak_inflight
+    result.configured_offset_s = configured_offset
+    result.collision_epoch_s = collision_epoch
     result.planned_start_s = planned_start
     result.actual_start_s = actual_start
     result.queue_wait_s = max(0.0, actual_start - planned_start)
     result.generator_lag_s = generator_lag
+
+
+def _scheduled_offset(scenario: Scenario) -> float:
+    if scenario.t_offset_s is None:
+        raise ValueError(f"scheduled scenario {scenario.id!r} is missing t_offset_s")
+    return scenario.t_offset_s
 
 
 def _planned_offsets(stage: LoadStage, request_count: int, *, seed: int) -> list[float]:
@@ -449,36 +487,265 @@ def _print_results_summary(report: dict, out_dir: Path) -> None:
     config = report.get("config", {})
     metrics = report.get("metrics", {})
     latency = metrics.get("latency_s", {}) if isinstance(metrics, dict) else {}
-    status_counts = (
-        metrics.get("status_counts", {}) if isinstance(metrics, dict) else {}
+    ttfa = metrics.get("ttfa_s", {}) if isinstance(metrics, dict) else {}
+    queue_wait = metrics.get("queue_wait_s", {}) if isinstance(metrics, dict) else {}
+    generator_lag = (
+        metrics.get("generator_lag_s", {}) if isinstance(metrics, dict) else {}
     )
+    rtf = metrics.get("rtf", {}) if isinstance(metrics, dict) else {}
     line_width = SUMMARY_LINE_WIDTH
-    label_width = SUMMARY_LABEL_WIDTH
     print(f"\n{'=' * line_width}")
     print(f"{'TTS Serving Benchmark Result':^{line_width}}")
     print(f"{'=' * line_width}")
-    print(f"  {'Model:':<{label_width}} {config.get('model_name', 'N/A')}")
-    print(f"  {'Profile:':<{label_width}} {config.get('profile', 'N/A')}")
-    print(f"  {'Passed:':<{label_width}} {overall.get('passed')}")
-    print(f"  {'Total scenarios:':<{label_width}} {overall.get('total')}")
-    print(f"  {'Passed scenarios:':<{label_width}} {overall.get('succeeded')}")
-    print(f"  {'Failed scenarios:':<{label_width}} {overall.get('failed')}")
-    print(
-        f"  {'Coverage contract valid:':<{label_width}} "
-        f"{overall.get('coverage_contract_valid')}"
+    _print_summary_row("Model", config.get("model_name", "N/A"))
+    _print_summary_row("Base URL", config.get("base_url", "N/A"))
+    _print_summary_row("Profile", config.get("profile", "N/A"))
+    _print_summary_row("Run ID", config.get("run_id") or "N/A")
+    _print_summary_row("Seed", config.get("seed"))
+    _print_summary_row("Passed", overall.get("passed"))
+    _print_summary_row("Harness status", report.get("harness_status"))
+    _print_summary_row(
+        "Scenarios",
+        (
+            f"{overall.get('succeeded')}/{overall.get('total')} passed, "
+            f"{overall.get('failed')} failed"
+        ),
     )
-    print(
-        f"  {'Load generation valid:':<{label_width}} "
-        f"{overall.get('load_generation_valid')}"
+    _print_summary_row("Traffic scenarios", overall.get("traffic_total"))
+    _print_summary_row("Coverage valid", overall.get("coverage_contract_valid"))
+    _print_summary_row("Load generation valid", overall.get("load_generation_valid"))
+    _print_summary_row(
+        "Status counts",
+        _format_counts(metrics.get("status_counts", {})),
     )
-    print(f"{'-' * line_width}")
-    print(f"  {'Latency mean (s):':<{label_width}} {latency.get('mean')}")
-    print(f"  {'Latency p95 (s):':<{label_width}} {latency.get('p95')}")
-    print(f"  {'Latency p99 (s):':<{label_width}} {latency.get('p99')}")
-    print(f"  {'Peak inflight:':<{label_width}} {metrics.get('peak_inflight')}")
-    print(f"  {'Status counts:':<{label_width}} {status_counts}")
-    print(f"  {'Results JSON:':<{label_width}} {out_dir / 'results.json'}")
+    _print_summary_row(
+        "HTTP status counts",
+        _format_counts(metrics.get("http_status_counts", {})),
+    )
+    _print_summary_row(
+        "Error classes",
+        _format_counts(metrics.get("error_class_counts", {})),
+    )
+
+    _print_summary_section("Performance")
+    _print_summary_row("Latency seconds", _format_summary(latency))
+    _print_summary_row("TTFA seconds", _format_summary(ttfa))
+    _print_summary_row("RTF", _format_summary(rtf))
+    _print_summary_row("Queue wait seconds", _format_summary(queue_wait))
+    _print_summary_row("Generator lag seconds", _format_summary(generator_lag))
+
+    _print_summary_section("Load Generator")
+    _print_summary_row("Peak inflight", metrics.get("peak_inflight"))
+    _print_summary_row("Peak pending tasks", metrics.get("peak_pending_tasks"))
+    _print_summary_row(
+        "Load generator issue",
+        metrics.get("load_generation_error") or "none",
+    )
+
+    _print_endpoint_summary(metrics.get("by_endpoint", {}))
+    _print_operation_summary(metrics.get("by_operation", {}))
+    _print_stage_summary(config, metrics.get("by_stage", {}))
+    _print_failure_summary(report)
+
+    _print_summary_section("Artifacts")
+    _print_summary_row("Results JSON", out_dir / "results.json")
+    _print_summary_row("Manifest JSON", out_dir / "manifest.json")
+    _print_summary_row("Raw results JSONL", out_dir / "raw_results.jsonl")
     print(f"{'=' * line_width}")
+
+
+def _print_summary_section(title: str) -> None:
+    print(f"{title:-^{SUMMARY_LINE_WIDTH}}")
+
+
+def _print_summary_row(label: str, value: object) -> None:
+    print(f"  {label + ':':<{SUMMARY_LABEL_WIDTH}} {_format_value(value)}")
+
+
+def _format_value(value: object) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return _format_float(value)
+    return str(value)
+
+
+def _format_float(value: float) -> str:
+    return f"{value:.6g}"
+
+
+def _format_summary(summary: object) -> str:
+    if not isinstance(summary, dict) or not summary:
+        return "N/A"
+    fields = (
+        ("mean", "mean"),
+        ("p50", "p50"),
+        ("p95", "p95"),
+        ("p99", "p99"),
+        ("p99_9", "p99.9"),
+        ("max", "max"),
+    )
+    return " ".join(
+        f"{label}={_format_value(summary[key])}"
+        for key, label in fields
+        if summary.get(key) is not None
+    )
+
+
+def _format_counts(counts: object) -> str:
+    if not isinstance(counts, dict) or not counts:
+        return "none"
+    return ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+
+
+def _summary_column_width(header: str, values: Iterable[object], minimum: int) -> int:
+    return max(len(header), minimum, *(len(str(value)) for value in values))
+
+
+def _print_endpoint_summary(by_endpoint: object) -> None:
+    if not isinstance(by_endpoint, dict) or not by_endpoint:
+        return
+    summaries = sorted(
+        by_endpoint.items(),
+        key=lambda item: (
+            int(item[1].get("total", 0)) if isinstance(item[1], dict) else 0
+        ),
+        reverse=True,
+    )
+    endpoint_width = _summary_column_width(
+        "Endpoint",
+        (endpoint for endpoint, summary in summaries if isinstance(summary, dict)),
+        16,
+    )
+    _print_summary_section("Endpoint Summary")
+    print(
+        "  "
+        f"{'Endpoint':<{endpoint_width}}"
+        f"{'Total':>8}"
+        f"{'Pass':>8}"
+        f"{'Fail':>8}"
+        f"{'Lat p95':>12}"
+        f"{'TTFA p95':>12}"
+        f"{'RTF mean':>12}"
+    )
+    for endpoint, summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        print(
+            "  "
+            f"{str(endpoint):<{endpoint_width}}"
+            f"{summary.get('total', 0):>8}"
+            f"{summary.get('succeeded', 0):>8}"
+            f"{summary.get('failed', 0):>8}"
+            f"{_summary_metric(summary, 'latency_s', 'p95'):>12}"
+            f"{_summary_metric(summary, 'ttfa_s', 'p95'):>12}"
+            f"{_summary_metric(summary, 'rtf', 'mean'):>12}"
+        )
+
+
+def _print_operation_summary(by_operation: object) -> None:
+    if not isinstance(by_operation, dict) or not by_operation:
+        return
+    summaries = sorted(
+        by_operation.items(),
+        key=lambda item: (
+            int(item[1].get("total", 0)) if isinstance(item[1], dict) else 0
+        ),
+        reverse=True,
+    )
+    operation_width = _summary_column_width(
+        "Operation",
+        (operation for operation, summary in summaries if isinstance(summary, dict)),
+        28,
+    )
+    _print_summary_section("Operation Summary")
+    print(
+        "  "
+        f"{'Operation':<{operation_width}}"
+        f"{'Total':>8}"
+        f"{'Pass':>8}"
+        f"{'Fail':>8}"
+        f"{'Lat p95':>12}"
+        f"{'RTF mean':>12}"
+    )
+    for operation, summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        print(
+            "  "
+            f"{str(operation):<{operation_width}}"
+            f"{summary.get('total', 0):>8}"
+            f"{summary.get('succeeded', 0):>8}"
+            f"{summary.get('failed', 0):>8}"
+            f"{_summary_metric(summary, 'latency_s', 'p95'):>12}"
+            f"{_summary_metric(summary, 'rtf', 'mean'):>12}"
+        )
+
+
+def _print_stage_summary(config: dict, by_stage: object) -> None:
+    if not isinstance(by_stage, dict) or not by_stage:
+        return
+    stage_ids = [
+        str(stage.get("id"))
+        for stage in config.get("load_stages", [])
+        if isinstance(stage, dict) and stage.get("id") in by_stage
+    ]
+    stage_ids.extend(stage_id for stage_id in by_stage if stage_id not in stage_ids)
+    stage_width = _summary_column_width("Stage", stage_ids, 24)
+    _print_summary_section("Load Stage Summary")
+    print(
+        "  "
+        f"{'Stage':<{stage_width}}"
+        f"{'Total':>8}"
+        f"{'Fail':>8}"
+        f"{'Peak':>8}"
+        f"{'RPS':>10}"
+        f"{'Lat p95':>12}"
+        f"{'TTFA p95':>12}"
+    )
+    for stage_id in stage_ids:
+        summary = by_stage.get(stage_id)
+        if not isinstance(summary, dict):
+            continue
+        print(
+            "  "
+            f"{str(stage_id):<{stage_width}}"
+            f"{summary.get('total', 0):>8}"
+            f"{summary.get('failed', 0):>8}"
+            f"{_format_value(summary.get('peak_inflight')):>8}"
+            f"{_format_value(summary.get('achieved_rps')):>10}"
+            f"{_summary_metric(summary, 'latency_s', 'p95'):>12}"
+            f"{_summary_metric(summary, 'ttfa_s', 'p95'):>12}"
+        )
+
+
+def _summary_metric(summary: dict, metric_name: str, value_name: str) -> str:
+    metric = summary.get(metric_name)
+    if not isinstance(metric, dict):
+        return "N/A"
+    return _format_value(metric.get(value_name))
+
+
+def _print_failure_summary(report: dict) -> None:
+    failures = report.get("failures", [])
+    coverage_failures = report.get("coverage_failures", [])
+    unsupported_contracts = report.get("unsupported_contracts", [])
+    if not failures and not coverage_failures and not unsupported_contracts:
+        return
+    _print_summary_section("Failures")
+    _print_summary_row("Coverage failures", len(coverage_failures))
+    _print_summary_row("Unsupported contracts", len(unsupported_contracts))
+    _print_summary_row("Recorded failures", len(failures))
+    if not isinstance(failures, list):
+        return
+    for failure in failures:
+        if not isinstance(failure, dict):
+            continue
+        scenario_id = str(failure.get("scenario_id", "unknown"))
+        status = str(failure.get("status", "unknown"))
+        error_class = str(failure.get("error_class") or "unknown")
+        error = str(failure.get("error") or "")
+        print(f"  - {scenario_id}: {status}, {error_class}, {error}")
 
 
 def main() -> int:
@@ -491,14 +758,17 @@ def main() -> int:
         print(f"benchmark harness failed: {exc}")
         return 2
 
-    scenarios = build_scenarios(spec)
-    stage_request_total = sum(stage.request_count for stage in spec.params.load_stages)
-    harness_log.append(
-        f"loaded spec={Path(args.spec)} profile={spec.params.profile} "
-        f"stage_requests={stage_request_total} scenarios={len(scenarios)} "
-        f"load_stages={[stage.id for stage in spec.params.load_stages]}"
-    )
+    scenarios: list[Scenario] = []
     try:
+        scenarios = build_scenarios(spec)
+        stage_request_total = sum(
+            stage.request_count for stage in spec.params.load_stages
+        )
+        harness_log.append(
+            f"loaded spec={Path(args.spec)} profile={spec.params.profile} "
+            f"stage_requests={stage_request_total} scenarios={len(scenarios)} "
+            f"load_stages={[stage.id for stage in spec.params.load_stages]}"
+        )
         results = asyncio.run(_run_benchmark(spec, scenarios, harness_log))
         report = build_results_report(spec, results, scenarios=scenarios)
         write_artifacts(out_dir, spec, scenarios, results, report)

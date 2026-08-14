@@ -25,11 +25,14 @@ Export a config to JSON::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import signal
 import socket
+import threading
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from typing import Any
 
 import uvicorn
@@ -38,6 +41,7 @@ from pydantic import BaseModel
 
 from sglang_omni.client import Client
 from sglang_omni.config import PipelineConfig
+from sglang_omni.models.model_capabilities import get_model_capabilities
 from sglang_omni.pipeline.mp_runner import MultiProcessPipelineRunner
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.profiler_control import ProfilerControlClient
@@ -52,19 +56,57 @@ from sglang_omni.utils.gpu_memory import (
 
 logger = logging.getLogger(__name__)
 
+_HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+class _PipelineUvicornServer(uvicorn.Server):
+    """Keep Uvicorn's graceful handling without re-raising process signals.
+
+    Uvicorn re-raises a captured SIGTERM after HTTP shutdown. That terminates
+    the interpreter before ``_run_server`` can stop spawned pipeline workers.
+    The pipeline launcher owns child-process cleanup, so it restores the
+    original handlers but deliberately consumes the already-handled signal.
+    """
+
+    @contextmanager
+    def capture_signals(self):
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+
+        original_handlers = {
+            sig: signal.signal(sig, self.handle_exit) for sig in _HANDLED_SIGNALS
+        }
+        try:
+            yield
+        finally:
+            for sig, handler in original_handlers.items():
+                signal.signal(sig, handler)
+            self._captured_signals.clear()
+
+
 # ---------------------------------------------------------------------------
 # Built-in pipeline registry
 # ---------------------------------------------------------------------------
 
 
 def _find_available_port(host: str, port: int) -> int:
-    """Return *port* if available, otherwise find a free port and warn."""
+    """Return *port* if available, otherwise find a free port and warn.
+
+    SGLANG_OMNI_STRICT_PORT=1 turns the fallback into a hard error: a
+    supervisor that health-checks the requested port (the same-GPU DP
+    launcher) must fail fast instead of silently serving elsewhere.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind((host, port))
             return port
-    except OSError:
-        pass
+    except OSError as exc:
+        if (os.environ.get("SGLANG_OMNI_STRICT_PORT") or "").strip() == "1":
+            raise RuntimeError(
+                f"port {port} is already in use on {host} and "
+                "SGLANG_OMNI_STRICT_PORT=1 forbids falling back"
+            ) from exc
     logger.warning(f"Port {port} is already in use on {host}.")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
@@ -148,6 +190,41 @@ def _placement_log_summary(
             for gpu_id, gpu in placement_plan.gpus.items()
         },
     }
+
+
+def _model_capabilities_log_summary(
+    pipeline_config: PipelineConfig,
+) -> dict[str, Any] | None:
+    architecture = getattr(type(pipeline_config), "architecture", None)
+    if architecture is None:
+        return None
+    capabilities = get_model_capabilities(architecture)
+    if capabilities is None:
+        return None
+    return {
+        "architecture": architecture,
+        "reference_audio": capabilities.supports_reference_audio,
+        "batch_vocoder": capabilities.supports_batch_vocoder,
+        "streaming_vocoder": capabilities.supports_streaming_vocoder,
+        "cuda_graph": capabilities.supports_cuda_graph,
+        "torch_compile": capabilities.supports_torch_compile,
+        "breakable_prefill_cuda_graph": (
+            capabilities.supports_breakable_prefill_cuda_graph
+        ),
+    }
+
+
+def _log_model_capabilities(pipeline_config: PipelineConfig) -> None:
+    try:
+        summary = _model_capabilities_log_summary(pipeline_config)
+    except Exception:
+        logger.warning(
+            "Failed to resolve model capabilities for startup log",
+            exc_info=True,
+        )
+        return
+    if summary is not None:
+        logger.info("Model capabilities: %s", json.dumps(summary, sort_keys=True))
 
 
 class StartReq(BaseModel):
@@ -295,6 +372,7 @@ async def _run_server(
     log_level: str = "info",
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
+    enable_metrics: bool = False,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -325,6 +403,7 @@ async def _run_server(
     logger.info(
         f"Resolved placement/topology plan: placement={placement_summary}",
     )
+    _log_model_capabilities(pipeline_config)
     logger.info(
         "Pipeline '%s' started (%d GPU(s))",
         pipeline_config.name,
@@ -343,11 +422,23 @@ async def _run_server(
             supports_uploaded_voice_references=(
                 pipeline_config.supports_uploaded_voice_references()
             ),
+            required_speech_reference_count=(
+                pipeline_config.required_speech_reference_count
+            ),
+            speech_reference_text_required=(
+                pipeline_config.speech_reference_text_required
+            ),
+            additional_speech_languages=pipeline_config.additional_speech_languages,
             enable_realtime=enable_realtime,
+            supports_realtime_audio_output=(
+                type(pipeline_config).code2wav_stage() is not None
+            ),
+            enable_metrics=enable_metrics,
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
             architectures=[pipeline_config.architecture],
+            audio_chunking=pipeline_config.audio_chunking,
         )
         profiler_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR")
         profiler_ctl = ProfilerControlClient(mp_runner.stage_control_endpoints)
@@ -360,7 +451,7 @@ async def _run_server(
             log_level=log_level,
             timeout_keep_alive=120,
         )
-        server = uvicorn.Server(config)
+        server = _PipelineUvicornServer(config)
         await _serve_with_failure_watch(server, [mp_runner.wait_failed()])
     finally:
         logger.info("Shutting down pipeline …")
@@ -415,6 +506,7 @@ def launch_server(
     log_level: str = "info",
     client_kwargs: dict[str, Any] | None = None,
     enable_realtime: bool = False,
+    enable_metrics: bool = False,
     allowed_local_media_path: str | None = None,
     allowed_media_domains: list[str] | None = None,
     tts_batch_max_items: int = DEFAULT_TTS_BATCH_MAX_ITEMS,
@@ -432,6 +524,9 @@ def launch_server(
             :class:`~sglang_omni.client.Client`.
         enable_realtime: If True, mount the WebSocket ``/v1/realtime``
             endpoint (OpenAI Realtime API).
+        enable_metrics: If True, expose the Omni API/coordinator Prometheus
+            ``/metrics`` endpoint. This does not enable or aggregate
+            underlying SGLang stage metrics.
         allowed_local_media_path: Directory allowed for ``file://`` media
             references in TTS requests.
         allowed_media_domains: Domains allowed for remote TTS reference audio.
@@ -448,6 +543,7 @@ def launch_server(
             log_level=log_level,
             client_kwargs=client_kwargs,
             enable_realtime=enable_realtime,
+            enable_metrics=enable_metrics,
             allowed_local_media_path=allowed_local_media_path,
             allowed_media_domains=allowed_media_domains,
             tts_batch_max_items=tts_batch_max_items,
