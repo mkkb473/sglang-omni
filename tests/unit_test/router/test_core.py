@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
+import signal
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -9,20 +13,28 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-import sglang_omni_router.launcher.local as local_launcher
-import sglang_omni_router.serve as serve_module
-from sglang_omni_router.config import DEFAULT_CAPABILITIES, RouterConfig, WorkerConfig
-from sglang_omni_router.health import HealthChecker
-from sglang_omni_router.launcher import LocalLauncher, LocalLauncherConfig
-from sglang_omni_router.launcher.config import load_launcher_config
-from sglang_omni_router.launcher.utils import build_gpu_assignments
-from sglang_omni_router.selector import NoEligibleWorkerError, WorkerSelector
-from sglang_omni_router.serve import (
+import sglang_omni_router.python.launcher.local as local_launcher
+import sglang_omni_router.python.serve as serve_module
+from sglang_omni_router.python.config import (
+    DEFAULT_CAPABILITIES,
+    RouterConfig,
+    WorkerConfig,
+)
+from sglang_omni_router.python.health import HealthChecker
+from sglang_omni_router.python.launcher import LocalLauncher, LocalLauncherConfig
+from sglang_omni_router.python.launcher.config import load_launcher_config
+from sglang_omni_router.python.launcher.utils import build_gpu_assignments
+from sglang_omni_router.python.selector import (
+    NoEligibleWorkerError,
+    WorkerSelector,
+    require_eligible_worker,
+)
+from sglang_omni_router.python.serve import (
     build_config_from_args,
     build_parser,
     resolve_managed_worker_capabilities,
 )
-from sglang_omni_router.worker import build_workers
+from sglang_omni_router.python.worker import build_workers
 
 
 @pytest.mark.parametrize(
@@ -381,7 +393,7 @@ def test_launcher_gpu_assignment_groups_visible_devices(monkeypatch) -> None:
 def test_launcher_gpu_assignment_allows_default_process_visibility(monkeypatch) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr(
-        "sglang_omni_router.launcher.utils.infer_available_cuda_devices",
+        "sglang_omni_router.python.launcher.utils.infer_available_cuda_devices",
         lambda: [],
     )
     config = LocalLauncherConfig(model_path="model", num_workers=1)
@@ -423,7 +435,7 @@ def test_launcher_cleans_up_managed_workers_on_health_timeout(monkeypatch) -> No
     monkeypatch.setattr(local_launcher, "wait_for_worker_health", fail_health)
     monkeypatch.setattr(
         local_launcher,
-        "_terminate_worker_process_groups",
+        "stop_managed_workers",
         record_terminated_workers,
     )
 
@@ -480,7 +492,7 @@ def test_launcher_cleans_up_managed_workers_on_startup_interrupt(monkeypatch) ->
     monkeypatch.setattr(local_launcher, "wait", interrupt_wait)
     monkeypatch.setattr(
         local_launcher,
-        "_terminate_worker_process_groups",
+        "stop_managed_workers",
         record_terminated_workers,
     )
 
@@ -540,7 +552,7 @@ def test_launcher_waits_for_managed_workers_in_parallel(monkeypatch) -> None:
     monkeypatch.setattr(local_launcher, "wait_for_worker_health", wait_health)
     monkeypatch.setattr(
         local_launcher,
-        "_terminate_worker_process_groups",
+        "stop_managed_workers",
         record_terminated_workers,
     )
 
@@ -557,6 +569,138 @@ def test_launcher_waits_for_managed_workers_in_parallel(monkeypatch) -> None:
         created_processes[1][0],
     ]
     assert launcher.worker_urls == []
+
+
+def test_managed_shutdown_signals_only_worker_parents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, int, int]] = []
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.pid = pid
+
+        def send_signal(self, sig: int) -> None:
+            events.append(("parent", self.pid, sig))
+
+        def wait(self, timeout: float) -> int:
+            assert timeout >= 0
+            events.append(("wait", self.pid, 0))
+            return 0
+
+    def check_group(process_group_id: int, sig: int) -> None:
+        events.append(("group", process_group_id, sig))
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(local_launcher.os, "killpg", check_group)
+    workers = [
+        local_launcher.ManagedWorkerProcess(
+            url=f"http://127.0.0.1:{port}",
+            port=port,
+            cuda_visible_devices=None,
+            process=FakeProcess(port),
+            process_group_id=port,
+        )
+        for port in (8011, 8012)
+    ]
+
+    local_launcher.stop_managed_workers(workers)
+
+    assert events == [
+        ("parent", 8011, signal.SIGINT),
+        ("parent", 8012, signal.SIGINT),
+        ("wait", 8011, 0),
+        ("group", 8011, 0),
+        ("wait", 8012, 0),
+        ("group", 8012, 0),
+    ]
+
+
+@pytest.mark.parametrize("parent_timed_out", [False, True])
+def test_managed_shutdown_kills_remaining_group(
+    monkeypatch: pytest.MonkeyPatch, parent_timed_out: bool
+) -> None:
+    group_signals: list[int] = []
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.wait_count = 0
+            self.signals: list[int] = []
+
+        def send_signal(self, sig: int) -> None:
+            self.signals.append(sig)
+
+        def wait(self, timeout: float) -> int:
+            self.wait_count += 1
+            if parent_timed_out and self.wait_count == 1:
+                raise subprocess.TimeoutExpired("worker", timeout)
+            return 0
+
+    def signal_group(process_group_id: int, sig: int) -> None:
+        assert process_group_id == 8011
+        group_signals.append(sig)
+
+    def group_exited(process_group_id: int) -> bool:
+        assert process_group_id == 8011
+        return False
+
+    monkeypatch.setattr(local_launcher.os, "killpg", signal_group)
+    monkeypatch.setattr(local_launcher, "process_group_has_live_members", group_exited)
+    process = FakeProcess()
+    worker = local_launcher.ManagedWorkerProcess(
+        url="http://127.0.0.1:8011",
+        port=8011,
+        cuda_visible_devices=None,
+        process=process,
+        process_group_id=8011,
+    )
+
+    local_launcher.stop_managed_workers([worker])
+
+    assert process.signals == [signal.SIGINT]
+    assert process.wait_count == 2
+    assert group_signals == (
+        [signal.SIGKILL] if parent_timed_out else [0, signal.SIGKILL]
+    )
+
+
+def test_managed_shutdown_waits_for_orphaned_worker_child() -> None:
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import subprocess, sys; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+            "print('ready', flush=True)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert parent.stdout is not None
+        assert parent.stdout.readline().strip() == "ready"
+        parent.wait(timeout=5)
+        assert local_launcher.process_group_has_live_members(parent.pid)
+
+        worker = local_launcher.ManagedWorkerProcess(
+            url="http://127.0.0.1:8011",
+            port=8011,
+            cuda_visible_devices=None,
+            process=parent,
+            process_group_id=parent.pid,
+        )
+        local_launcher.stop_managed_workers([worker])
+
+        assert not local_launcher.process_group_has_live_members(parent.pid)
+    finally:
+        try:
+            local_launcher.os.killpg(parent.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        parent.wait(timeout=5)
+        if parent.stdout is not None:
+            parent.stdout.close()
 
 
 @pytest.mark.parametrize(
@@ -579,6 +723,31 @@ def test_router_config_rejects_non_positive_integer_knobs(field: str) -> None:
         )
 
 
+def test_router_cli_max_connections_defaults_to_auto() -> None:
+    args = build_parser().parse_args(
+        [
+            "--worker-urls",
+            "http://127.0.0.1:8101",
+            "http://127.0.0.1:8102",
+            "http://127.0.0.1:8103",
+        ]
+    )
+
+    config = build_config_from_args(args)
+
+    assert config.max_connections == 384
+
+
+def test_router_cli_max_connections_explicit_passes_through() -> None:
+    args = build_parser().parse_args(
+        ["--worker-urls", "http://127.0.0.1:8101", "--max-connections", "512"]
+    )
+
+    config = build_config_from_args(args)
+
+    assert config.max_connections == 512
+
+
 def test_router_config_rejects_hyphenated_policy_aliases() -> None:
     with pytest.raises(ValidationError):
         RouterConfig(
@@ -587,10 +756,21 @@ def test_router_config_rejects_hyphenated_policy_aliases() -> None:
         )
 
 
-def test_router_console_script_entrypoint_resolves() -> None:
+@pytest.mark.parametrize(
+    "manifest_name",
+    (
+        "pyproject.toml",
+        "pyproject_rocm.toml",
+        "pyproject_xpu.toml",
+        "pyproject_npu.toml",
+    ),
+)
+def test_python_router_console_script_entrypoint_resolves(
+    manifest_name: str,
+) -> None:
     script_target = None
     in_project_scripts = False
-    pyproject = Path(__file__).resolve().parents[3] / "pyproject.toml"
+    pyproject = Path(__file__).resolve().parents[3] / manifest_name
     for line in pyproject.read_text().splitlines():
         stripped = line.strip()
         if stripped == "[project.scripts]":
@@ -598,11 +778,11 @@ def test_router_console_script_entrypoint_resolves() -> None:
             continue
         if in_project_scripts and stripped.startswith("["):
             break
-        if in_project_scripts and stripped.startswith("sgl-omni-router"):
+        if in_project_scripts and stripped.startswith("sgl-omni-router-py ="):
             script_target = stripped.split("=", 1)[1].strip().strip('"')
             break
 
-    assert script_target == "sglang_omni_router.serve:main"
+    assert script_target == "sglang_omni_router.python.serve:main"
     module_name, function_name = script_target.split(":")
     entrypoint = getattr(importlib.import_module(module_name), function_name)
     assert callable(entrypoint)
@@ -641,6 +821,63 @@ launcher:
 
     assert exc.value.code == 130
     assert events == ["model", "shutdown"]
+
+
+def test_shutdown_drain_defaults_to_the_request_timeout() -> None:
+    args = build_parser().parse_args(
+        ["--worker-urls", "http://127.0.0.1:8101", "--request-timeout-secs", "300"]
+    )
+    assert build_config_from_args(args).effective_shutdown_drain_secs == 300
+
+    args = build_parser().parse_args(
+        ["--worker-urls", "http://127.0.0.1:8101", "--shutdown-drain-secs", "42"]
+    )
+    assert build_config_from_args(args).effective_shutdown_drain_secs == 42
+
+
+def test_invalid_multiprocess_config_launches_no_workers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "launcher.yaml"
+    config_path.write_text(
+        """
+launcher:
+  backend: local
+  model_path: model
+  num_workers: 1
+""",
+        encoding="utf-8",
+    )
+    events: list[str] = []
+
+    class FakeLauncher:
+        def __init__(self, config) -> None:
+            events.append("init")
+
+        def launch_and_wait(self) -> list[str]:
+            events.append("launch")
+            return ["http://127.0.0.1:8011"]
+
+        def shutdown(self) -> None:
+            events.append("shutdown")
+
+    monkeypatch.setattr(serve_module, "LocalLauncher", FakeLauncher)
+    monkeypatch.setattr(serve_module.logging.config, "dictConfig", lambda config: None)
+
+    with pytest.raises(SystemExit) as exc:
+        serve_module.main(
+            [
+                "--launcher-config",
+                str(config_path),
+                "--router-processes",
+                "2",
+                "--policy",
+                "least_request",
+            ]
+        )
+
+    assert exc.value.code == 2
+    assert events == []
 
 
 def test_selector_filters_by_health_and_capability() -> None:
@@ -761,6 +998,54 @@ def test_selector_preserves_unannotated_homogeneous_pool_behavior() -> None:
     )
 
 
+def test_exact_worker_eligibility_does_not_advance_round_robin() -> None:
+    workers = build_workers(
+        [
+            WorkerConfig(url="http://127.0.0.1:8101"),
+            WorkerConfig(url="http://127.0.0.1:8102"),
+        ]
+    )
+    for worker in workers:
+        worker.state = "healthy"
+
+    selector = WorkerSelector("round_robin")
+    assert selector.select(workers, required_capabilities={"chat"}) is workers[0]
+    assert (
+        require_eligible_worker(
+            workers[0],
+            required_capabilities={"speech"},
+        )
+        is workers[0]
+    )
+    assert selector.select(workers, required_capabilities={"chat"}) is workers[1]
+
+
+def test_exact_worker_eligibility_applies_model_and_capability_contract() -> None:
+    worker = build_workers(
+        [
+            WorkerConfig(
+                url="http://127.0.0.1:8101",
+                model="model-a",
+                capabilities={"speech"},
+            )
+        ]
+    )[0]
+    worker.state = "healthy"
+
+    with pytest.raises(NoEligibleWorkerError):
+        require_eligible_worker(
+            worker,
+            required_capabilities={"speech", "audio_input"},
+            requested_model="model-a",
+        )
+    with pytest.raises(NoEligibleWorkerError):
+        require_eligible_worker(
+            worker,
+            required_capabilities={"speech"},
+            requested_model="model-b",
+        )
+
+
 def test_round_robin_recomputes_candidates_after_health_change() -> None:
     workers = build_workers(
         [
@@ -815,6 +1100,40 @@ def test_least_request_selects_lowest_active_request_count() -> None:
         selector.select(workers, required_capabilities={"speech"}).url
         == "http://127.0.0.1:8102"
     )
+
+
+def test_round_robin_keeps_stagger_after_candidate_pool_shrinks() -> None:
+    workers = build_workers(
+        [
+            WorkerConfig(url="http://127.0.0.1:8101"),
+            WorkerConfig(url="http://127.0.0.1:8102"),
+        ]
+    )
+    for worker in workers:
+        worker.state = "healthy"
+
+    selectors = [WorkerSelector("round_robin", rr_offset=index) for index in range(2)]
+
+    picks = [
+        selector.select(workers, required_capabilities={"speech"}).url
+        for selector in selectors
+    ]
+    assert picks[0] != picks[1]
+
+    workers[1].state = "unhealthy"
+    for selector in selectors:
+        assert (
+            selector.select(workers, required_capabilities={"speech"}).url
+            == "http://127.0.0.1:8101"
+        )
+    workers[1].state = "healthy"
+
+    for _ in range(4):
+        picks = [
+            selector.select(workers, required_capabilities={"speech"}).url
+            for selector in selectors
+        ]
+        assert picks[0] != picks[1]
 
 
 def test_worker_request_guard_cleans_up_count() -> None:
@@ -929,3 +1248,376 @@ async def test_health_checker_isolates_unexpected_worker_check_errors() -> None:
     assert workers[0].last_error is None
     assert workers[1].state == "healthy"
     assert workers[1].last_status_code == 200
+
+
+def test_nofile_check_warns_when_soft_limit_too_low(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(serve_module, "read_nofile_soft_limit", lambda: 1024)
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=512,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="sglang_omni_router.python.serve"):
+        serve_module.check_file_descriptor_limit(config)
+
+    assert "nofile soft limit 1024 is below 1088" in caplog.text
+    assert "ulimit -n 1088" in caplog.text
+    # max_connections drives the pool here, so it is the flag to lower.
+    assert "max(--max-connections=512, --max-inflight=512)" in caplog.text
+    assert "lower --max-connections" in caplog.text
+
+
+def test_nofile_check_silent_when_soft_limit_sufficient(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(serve_module, "read_nofile_soft_limit", lambda: 65536)
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=512,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="sglang_omni_router.python.serve"):
+        serve_module.check_file_descriptor_limit(config)
+
+    assert "nofile soft limit" not in caplog.text
+
+
+def test_nofile_check_strict_mode_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(serve_module, "read_nofile_soft_limit", lambda: 1024)
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=512,
+    )
+
+    with pytest.raises(ValueError, match="nofile soft limit 1024"):
+        serve_module.check_file_descriptor_limit(config, strict=True)
+
+
+def test_strict_limits_flag_defaults_off() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["--worker-urls", "http://127.0.0.1:8101"])
+    assert args.strict_limits is False
+
+    args = parser.parse_args(
+        ["--worker-urls", "http://127.0.0.1:8101", "--strict-limits"]
+    )
+    assert args.strict_limits is True
+
+
+def test_max_inflight_defaults_to_max_connections() -> None:
+    args = build_parser().parse_args(
+        ["--worker-urls", "http://127.0.0.1:8101", "--max-connections", "256"]
+    )
+    config = build_config_from_args(args)
+
+    assert config.max_inflight is None
+    assert config.effective_max_inflight == 256
+
+
+def test_max_inflight_flag_decouples_from_max_connections() -> None:
+    args = build_parser().parse_args(
+        [
+            "--worker-urls",
+            "http://127.0.0.1:8101",
+            "--max-connections",
+            "256",
+            "--max-inflight",
+            "32",
+        ]
+    )
+    config = build_config_from_args(args)
+
+    assert config.effective_max_inflight == 32
+    assert config.max_connections == 256
+
+
+def test_max_inflight_rejects_non_positive_values() -> None:
+    with pytest.raises(ValidationError):
+        RouterConfig(
+            workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+            max_inflight=0,
+        )
+
+
+def test_upstream_pool_size_covers_admission_bound() -> None:
+    # Default: bound == pool == resolved max_connections (128 x workers).
+    config = RouterConfig(workers=[WorkerConfig(url="http://127.0.0.1:8101")])
+    assert config.upstream_pool_size == config.max_connections == 128
+
+    # Bound below the pool: the pool keeps its connection capacity.
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=256,
+        max_inflight=32,
+    )
+    assert config.upstream_pool_size == 256
+
+    # Note (Jiaxin Deng): failing before: the pool was sized to
+    # max_connections alone, so a bound above it queued admitted requests
+    # inside the pool until PoolTimeout surfaced as a late 502.
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=64,
+        max_inflight=800,
+    )
+    assert config.upstream_pool_size == 800
+
+
+def test_nofile_check_follows_the_upstream_pool_size(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(serve_module, "read_nofile_soft_limit", lambda: 1024)
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=64,
+        max_inflight=800,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="sglang_omni_router.python.serve"):
+        serve_module.check_file_descriptor_limit(config)
+
+    assert "nofile soft limit 1024 is below 1664" in caplog.text
+    # max_inflight (800) drives max(64, 800), so lowering --max-connections
+    # cannot help; the remediation must name --max-inflight.
+    assert "max(--max-connections=64, --max-inflight=800)" in caplog.text
+    assert "lower --max-inflight" in caplog.text
+
+
+def test_nofile_check_explicit_tie_recommends_both_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(serve_module, "read_nofile_soft_limit", lambda: 1024)
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=512,
+        max_inflight=512,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="sglang_omni_router.python.serve"):
+        serve_module.check_file_descriptor_limit(config)
+
+    # Both flags are explicitly set to the value that binds max(512, 512), so
+    # lowering only one leaves the other holding the pool; recommend both.
+    assert "nofile soft limit 1024 is below 1088" in caplog.text
+    assert "lower both --max-connections and --max-inflight" in caplog.text
+
+
+def test_nofile_check_derived_tie_recommends_max_connections(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(serve_module, "read_nofile_soft_limit", lambda: 1024)
+    # max_inflight unset: effective_max_inflight derives from max_connections, so
+    # lowering --max-connections also lowers the admission bound and clears it.
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=512,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="sglang_omni_router.python.serve"):
+        serve_module.check_file_descriptor_limit(config)
+
+    assert "lower --max-connections" in caplog.text
+    assert "lower both" not in caplog.text
+
+
+def test_router_processes_defaults_to_one() -> None:
+    args = build_parser().parse_args(["--worker-urls", "http://127.0.0.1:8101"])
+    assert args.router_processes == 1
+
+
+def test_multiprocess_rejects_voice_owner_configuration(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        serve_module.main(
+            [
+                "--worker-urls",
+                "http://127.0.0.1:8101",
+                "--router-processes",
+                "2",
+                "--voice-owner-worker-url",
+                "http://127.0.0.1:8101",
+            ]
+        )
+    assert (
+        "--voice-owner-worker-url requires --router-processes 1"
+        in capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_router_processes_rejects_non_positive(
+    value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        serve_module.main(
+            ["--worker-urls", "http://127.0.0.1:8101", "--router-processes", value]
+        )
+    assert "--router-processes must be >= 1" in capsys.readouterr().err
+
+
+def test_router_state_dir_reaches_the_router_config(tmp_path: Path) -> None:
+    args = build_parser().parse_args(
+        [
+            "--worker-urls",
+            "http://127.0.0.1:8101",
+            "--router-state-dir",
+            str(tmp_path / "state"),
+        ]
+    )
+    assert build_config_from_args(args).router_state_dir == str(tmp_path / "state")
+
+
+def test_multiprocess_startup_fails_closed_when_the_state_dir_is_unusable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Note (Jiaxin Deng): no temp-directory fallback, and the multi-process
+    # router exists to serve weight updates, so a journal it cannot write is a
+    # startup error rather than a surprise on the first update.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    unusable = str(blocker / "state")
+
+    with pytest.raises(SystemExit):
+        serve_module.main(
+            [
+                "--worker-urls",
+                "http://127.0.0.1:8101",
+                "--router-processes",
+                "2",
+                "--router-state-dir",
+                unusable,
+            ]
+        )
+
+    assert unusable in capsys.readouterr().err
+
+
+def test_single_process_startup_survives_an_unusable_state_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Note (Jiaxin Deng): the single-process relay predates the journal, so a
+    # read-only or home-less container must still start; the weight update
+    # refuses instead.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    served: dict = {}
+
+    def fake_run(app, **kwargs):
+        served["app"] = app
+
+    monkeypatch.setattr(serve_module.uvicorn, "run", fake_run)
+    serve_module.main(
+        [
+            "--worker-urls",
+            "http://127.0.0.1:8101",
+            "--router-state-dir",
+            str(blocker / "state"),
+        ]
+    )
+
+    assert served["app"] is not None
+
+
+def test_router_processes_multiprocess_runs_the_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict = {}
+
+    class FakeSupervisor:
+        def __init__(self, config, *, router_processes):
+            calls["config"] = config
+            calls["router_processes"] = router_processes
+
+        def start(self):
+            calls["started"] = True
+
+        def run_forever(self):
+            calls["ran"] = True
+
+        stopped_by_interrupt = False
+
+    monkeypatch.setattr(serve_module, "RouterSupervisor", FakeSupervisor)
+    # Note (Jiaxin Deng): setenv-then-delenv makes monkeypatch own
+    # SGLANG_OMNI_ADMIN_KEY, so the key serve.main writes into os.environ is restored at
+    # teardown.
+    monkeypatch.setenv("SGLANG_OMNI_ADMIN_KEY", "__owned_by_monkeypatch__")
+    monkeypatch.delenv("SGLANG_OMNI_ADMIN_KEY")
+    serve_module.main(
+        [
+            "--worker-urls",
+            "http://127.0.0.1:8101",
+            "--router-processes",
+            "2",
+            "--admin-api-key",
+            "cli-admin-key",
+        ]
+    )
+    assert calls["router_processes"] == 2
+    assert calls["config"].workers[0].url == "http://127.0.0.1:8101"
+    assert calls["started"] and calls["ran"]
+    # Note (Jiaxin Deng): a CLI-provided admin key must reach the CP child through the
+    # env
+    import os
+
+    assert os.environ["SGLANG_OMNI_ADMIN_KEY"] == "cli-admin-key"
+
+
+def test_app_factory_rebuilds_config_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sglang_omni_router.python import app_factory
+
+    config = RouterConfig(
+        workers=[WorkerConfig(url="http://127.0.0.1:8101")],
+        max_connections=64,
+        max_inflight=128,
+    )
+    config_path = tmp_path / "router_config.json"
+    config_path.write_text(config.model_dump_json(), encoding="utf-8")
+    monkeypatch.setenv(app_factory.CONFIG_FILE_ENV, str(config_path))
+
+    loaded = app_factory.load_config_from_env()
+
+    assert loaded == config
+    assert loaded.effective_max_inflight == config.effective_max_inflight
+    assert loaded.upstream_pool_size == config.upstream_pool_size
+
+
+def test_app_factory_builds_the_same_app_surface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sglang_omni_router.python import app_factory
+    from sglang_omni_router.python.app import create_app
+
+    config = RouterConfig(workers=[WorkerConfig(url="http://127.0.0.1:8101")])
+    config_path = tmp_path / "router_config.json"
+    config_path.write_text(config.model_dump_json(), encoding="utf-8")
+    monkeypatch.setenv(app_factory.CONFIG_FILE_ENV, str(config_path))
+
+    app = app_factory.create_app_from_env()
+    reference = create_app(config)
+
+    assert {route.path for route in app.routes} == {
+        route.path for route in reference.routes
+    }
+
+
+def test_app_factory_requires_the_config_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni_router.python import app_factory
+
+    monkeypatch.delenv(app_factory.CONFIG_FILE_ENV, raising=False)
+    with pytest.raises(RuntimeError, match="SGLANG_OMNI_ROUTER_CONFIG_FILE"):
+        app_factory.load_config_from_env()

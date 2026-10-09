@@ -14,6 +14,7 @@ from typing import Any
 
 import aiohttp
 
+from benchmarks.benchmarker.conditions import sampling_seed_field
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import SendFn
 from benchmarks.benchmarker.utils import get_wav_duration, save_json_results
@@ -71,6 +72,7 @@ def _build_request_payload(
     modalities: list[str],
     max_tokens: int,
     temperature: float,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model_name,
@@ -85,6 +87,7 @@ def _build_request_payload(
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": False,
+        **sampling_seed_field(seed),
     }
     if "audio" in modalities:
         payload["audio"] = {"format": "wav"}
@@ -170,6 +173,7 @@ def make_mmsu_send_fn(
     prompt: str = DEFAULT_PROMPT,
     max_tokens: int = 32,
     temperature: float = 0.0,
+    seed: int | None = None,
     save_audio_dir: str | None = None,
 ) -> SendFn:
     if modalities is None:
@@ -189,6 +193,7 @@ def make_mmsu_send_fn(
             modalities=modalities,
             max_tokens=max_tokens,
             temperature=temperature,
+            seed=seed,
         )
 
         start_time = time.perf_counter()
@@ -288,6 +293,7 @@ def save_mmsu_results(
     config: dict[str, Any],
     output_dir: str,
     *,
+    benchmark_name: str = "mmsu",
     speed_metrics: dict[str, Any] | None = None,
     wer_metrics: dict[str, Any] | None = None,
 ) -> None:
@@ -301,15 +307,15 @@ def save_mmsu_results(
     if wer_metrics:
         summary_output["wer"] = wer_metrics
 
-    save_json_results(summary_output, output_dir, "mmsu_results.json")
+    save_json_results(summary_output, output_dir, f"{benchmark_name}_results.json")
 
     os.makedirs(output_dir, exist_ok=True)
-    jsonl_path = os.path.join(output_dir, "mmsu_predictions.jsonl")
+    jsonl_path = os.path.join(output_dir, f"{benchmark_name}_predictions.jsonl")
     with open(jsonl_path, "w") as file_obj:
         for result in results:
             file_obj.write(json.dumps(asdict(result)) + "\n")
 
-    csv_path = os.path.join(output_dir, "mmsu_results.csv")
+    csv_path = os.path.join(output_dir, f"{benchmark_name}_results.csv")
     if results:
         fieldnames = list(asdict(results[0]).keys())
         with open(csv_path, "w", newline="") as file_obj:

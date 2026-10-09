@@ -14,9 +14,10 @@ from typing import TypedDict
 
 import aiohttp
 
+from benchmarks.benchmarker.conditions import sampling_seed_field
 from benchmarks.benchmarker.data import RequestResult
 from benchmarks.benchmarker.runner import SendFn
-from benchmarks.dataset.mmmu import MMMUSample, image_to_data_uri
+from benchmarks.dataset.mmmu import MMMUSample
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,7 @@ def make_mmmu_send_fn(
     *,
     max_tokens: int = 2048,
     temperature: float = 0.0,
+    seed: int | None = None,
     enable_audio: bool = False,
     audio_dir: str | None = None,
 ) -> SendFn:
@@ -252,11 +254,12 @@ def make_mmmu_send_fn(
         payload: dict = {
             "model": model_name,
             "messages": [{"role": "user", "content": sample.prompt}],
-            "images": [image_to_data_uri(img) for img in sample.images],
+            "images": list(sample.image_data_uris),
             "modalities": modalities,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "stream": False,
+            **sampling_seed_field(seed),
         }
         if enable_audio:
             payload["audio"] = {"format": "wav"}

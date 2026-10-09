@@ -21,38 +21,26 @@ import pytest
 
 from benchmarks.dataset.prepare import DATASETS
 from benchmarks.eval.benchmark_omni_mmsu import run as run_mmsu
+from benchmarks.metrics._format import format_benchmark_dataset_label
 from benchmarks.metrics.mmsu import print_mmsu_summary
+from tests.test_model.omni_ci_config import OmniCiModelPreset
 from tests.test_model.omni_router_utils import (
     ManagedRouterHandle,
     router_worker_traffic_guard,
 )
-from tests.utils import MetricCheckCollector, apply_slack, assert_speed_thresholds
+from tests.utils import MetricCheckCollector, assert_speed_thresholds
 
 CONCURRENCY = 16
 
-MMSU_MIN_ACCURACY = 0.699
 
-# (Note: Xuesong)P95 recalibrated for the #698 backend bump
-# new stack measures ~50.6 qps (3 CI rounds, sigma~0.1) vs ~60.8 on the old stack,
-# ~16% slower from diffuse per-request host overhead, NOT GPU.
-# compute (all MoE/attention/audio-encoder kernels are speed-identical cross-version;
-# util-ratio == qps-ratio). See PR.
-_MMSU_P95 = {
-    16: {
-        "throughput_qps": 68.3,  # was 62.519
-        "output_tok_per_req_s": 8.8,  # was 8.1
-        "latency_mean_s": 0.234,  # was 0.255
-    },
-}
-MMSU_THRESHOLDS = apply_slack(_MMSU_P95)
-
-
-def _build_args(port: int, output_dir: str) -> argparse.Namespace:
+def build_args(
+    omni_ci_model: OmniCiModelPreset, port: int, output_dir: str
+) -> argparse.Namespace:
     return argparse.Namespace(
         base_url=None,
         host="localhost",
         port=port,
-        model="qwen3-omni",
+        model=omni_ci_model.name,
         modalities="text",
         output_dir=output_dir,
         max_samples=None,
@@ -68,6 +56,7 @@ def _build_args(port: int, output_dir: str) -> argparse.Namespace:
         save_audio=False,
         disable_tqdm=False,
         seed=None,
+        fingerprint=False,
         repo_id=DATASETS["mmsu-ci-2000"],
         # Unused by this text-output benchmark (modalities="text"); kept for API consistency with run().
         lang="en",
@@ -77,23 +66,31 @@ def _build_args(port: int, output_dir: str) -> argparse.Namespace:
 
 @pytest.mark.benchmark
 def test_mmsu_accuracy_and_speed(
-    qwen3_omni_bf16_colocated_thinker_server: ManagedRouterHandle,
+    omni_ci_model: OmniCiModelPreset,
+    omni_ci_server: ManagedRouterHandle,
     tmp_path: Path,
 ) -> None:
     """Run MMSU eval and assert accuracy and speed meet thresholds."""
-    args = _build_args(
-        qwen3_omni_bf16_colocated_thinker_server.port, str(tmp_path / "mmsu")
-    )
+    args = build_args(omni_ci_model, omni_ci_server.port, str(tmp_path / "mmsu"))
     with router_worker_traffic_guard(
-        qwen3_omni_bf16_colocated_thinker_server,
-        label="Qwen3-Omni MMSU",
+        omni_ci_server,
+        label=f"{omni_ci_model.name} MMSU",
     ) as router_guard:
         results = asyncio.run(run_mmsu(args))
 
-    print_mmsu_summary(results["accuracy"], args.model, speed_metrics=results["speed"])
+    print_mmsu_summary(
+        results["accuracy"],
+        args.model,
+        speed_metrics=results["speed"],
+        dataset=format_benchmark_dataset_label(
+            dataset="mmsu-ci-2000",
+            repo_id=args.repo_id,
+        ),
+    )
 
     failed = results["accuracy"].get("failed_samples", 0)
     total = results["accuracy"].get("total_samples", 0)
+    thresholds = omni_ci_model.thresholds["mmsu"]
     checks = MetricCheckCollector("MMSU accuracy and speed")
     checks.check_assertion(
         "router traffic",
@@ -109,16 +106,18 @@ def test_mmsu_accuracy_and_speed(
     accuracy = results["accuracy"].get("overall_accuracy")
     if accuracy is None:
         checks.fail("MMSU overall_accuracy missing from accuracy results")
-    else:
+    elif thresholds.calibrated:
         checks.check(
-            accuracy >= MMSU_MIN_ACCURACY,
+            accuracy >= thresholds.accuracy,
             f"MMSU accuracy {accuracy:.4f} ({accuracy * 100:.1f}%) < "
-            f"threshold {MMSU_MIN_ACCURACY} ({MMSU_MIN_ACCURACY * 100:.0f}%)",
+            f"threshold {thresholds.accuracy} ({thresholds.accuracy * 100:.0f}%)",
         )
 
-    assert_speed_thresholds(
-        results["speed"], MMSU_THRESHOLDS, CONCURRENCY, collector=checks
-    )
+    if thresholds.calibrated:
+        assert_speed_thresholds(
+            results["speed"], thresholds.speed, CONCURRENCY, collector=checks
+        )
+    thresholds.require_calibrated(omni_ci_model.name, "mmsu", checks)
     checks.assert_all()
 
 

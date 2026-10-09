@@ -10,8 +10,12 @@ import numpy as np
 from benchmarks.metrics._format import (
     SPEED_LABEL_WIDTH,
     SPEED_LINE_WIDTH,
+    print_benchmark_dataset_line,
     print_speed_metric_line,
 )
+
+# Mirrors ``_CER_ABOVE_50_FRACTION``; drives the ``*_50_*`` metric keys.
+_WER_ABOVE_50_FRACTION = 0.5
 
 
 @dataclass
@@ -49,6 +53,7 @@ def calculate_wer_metrics(outputs: list[SampleOutput], lang: str) -> dict:
             "wer_per_sample_p95": 0.0,
             "wer_per_sample_max": 0.0,
             "wer_below_50_corpus": 0.0,
+            "wer_below_50_per_sample_mean": 0.0,
             "n_above_50_pct_wer": 0,
             "pct_above_50_pct_wer": 0.0,
             "latency_mean_s": 0.0,
@@ -72,8 +77,8 @@ def calculate_wer_metrics(outputs: list[SampleOutput], lang: str) -> dict:
         if o.audio_duration_s > 0 and o.latency_s > 0
     ]
 
-    n_above_50 = int(np.sum(wer_arr > 0.5))
-    ok_samples = [o for o in successes if o.wer <= 0.5]
+    n_above_50 = int(np.sum(wer_arr > _WER_ABOVE_50_FRACTION))
+    ok_samples = [o for o in successes if o.wer <= _WER_ABOVE_50_FRACTION]
     if ok_samples:
         ok_errors = sum(
             o.substitutions + o.deletions + o.insertions for o in ok_samples
@@ -95,6 +100,9 @@ def calculate_wer_metrics(outputs: list[SampleOutput], lang: str) -> dict:
         "wer_per_sample_p95": float(np.percentile(wer_arr, 95)),
         "wer_per_sample_max": float(np.max(wer_arr)),
         "wer_below_50_corpus": float(wer_below_50_micro),
+        "wer_below_50_per_sample_mean": (
+            float(np.mean([o.wer for o in ok_samples])) if ok_samples else 0.0
+        ),
         "n_above_50_pct_wer": n_above_50,
         "pct_above_50_pct_wer": (n_above_50 / len(successes) * 100 if successes else 0),
         "latency_mean_s": float(np.mean(latency_arr)),
@@ -123,6 +131,7 @@ def _print_wer_summary_table(
     model_label: str,
     generation_mode: str | None = None,
     tts_speed_summary: dict | None = None,
+    dataset: str | None = None,
 ) -> None:
     lw = SPEED_LABEL_WIDTH
     w = SPEED_LINE_WIDTH
@@ -135,6 +144,7 @@ def _print_wer_summary_table(
     print(f"{title:^{w}}")
     print(f"{'=' * w}")
     print(f"  {model_label:<{lw}} {model_name}")
+    print_benchmark_dataset_line(lw, dataset)
     if generation_mode:
         print(f"  {'Generation mode:':<{lw}} {generation_mode}")
     print(f"  {'Language:':<{lw}} {metrics.get('lang', 'N/A')}")
@@ -178,6 +188,11 @@ def _print_wer_summary_table(
         f"({_metric_value(metrics, 'wer_below_50_corpus') * 100:.2f}%)"
     )
     print(
+        f"  {'WER mean (excl >50%):':<{lw}} "
+        f"{_metric_value(metrics, 'wer_below_50_per_sample_mean'):.4f} "
+        f"({_metric_value(metrics, 'wer_below_50_per_sample_mean') * 100:.2f}%)"
+    )
+    print(
         f"  {'>50% WER samples:':<{lw}} "
         f"{metrics.get('n_above_50_pct_wer', 0)} "
         f"({metrics.get('pct_above_50_pct_wer', 0):.1f}%)"
@@ -205,6 +220,7 @@ def print_wer_summary(
     generation_mode: str | None = None,
     *,
     tts_speed_summary: dict | None = None,
+    dataset: str | None = None,
 ) -> None:
     _print_wer_summary_table(
         metrics,
@@ -213,15 +229,19 @@ def print_wer_summary(
         model_label="TTS model:",
         generation_mode=generation_mode,
         tts_speed_summary=tts_speed_summary,
+        dataset=dataset,
     )
 
 
-def print_asr_wer_summary(metrics: dict, model_name: str) -> None:
+def print_asr_wer_summary(
+    metrics: dict, model_name: str, *, dataset: str | None = None
+) -> None:
     _print_wer_summary_table(
         metrics,
         model_name,
         title="ASR WER Benchmark Result",
         model_label="ASR model:",
+        dataset=dataset,
     )
 
 
@@ -287,7 +307,9 @@ def calculate_asr_speed_metrics(
     }
 
 
-def print_asr_speed_summary(metrics: dict, model_name: str) -> None:
+def print_asr_speed_summary(
+    metrics: dict, model_name: str, *, dataset: str | None = None
+) -> None:
     """Print ASR speed metrics summary table."""
     lw = SPEED_LABEL_WIDTH
     w = SPEED_LINE_WIDTH
@@ -295,6 +317,7 @@ def print_asr_speed_summary(metrics: dict, model_name: str) -> None:
     print(f"{'ASR Speed Benchmark Result':^{w}}")
     print(f"{'=' * w}")
     print(f"  {'ASR model:':<{lw}} {model_name}")
+    print_benchmark_dataset_line(lw, dataset)
     print(
         f"  {'Evaluated / Total:':<{lw}} "
         f"{metrics.get('evaluated', 0)}/{metrics.get('total_samples', 0)}"

@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from sglang_omni.scheduling.messages import IncomingMessage
+from sglang_omni.scheduling.message import IncomingMessage
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 
@@ -45,6 +45,19 @@ def run_scheduler(
     finally:
         scheduler.stop()
         thread.join(timeout=2.0)
+
+
+def test_stop_runs_shutdown_callback_once() -> None:
+    shutdowns: list[None] = []
+    scheduler = SimpleScheduler(
+        lambda payload: payload,
+        shutdown_callback=lambda: shutdowns.append(None),
+    )
+
+    scheduler.stop()
+    scheduler.stop()
+
+    assert shutdowns == [None]
 
 
 def test_max_concurrency_runs_sync_fn_in_parallel() -> None:

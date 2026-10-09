@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from sglang_omni.client.types import (
@@ -13,16 +15,17 @@ from sglang_omni.client.types import (
     GenerateRequest,
     UsageInfo,
 )
+from sglang_omni.proto import EXPLICIT_GENERATION_PARAMS_KEY
 from sglang_omni.serve import create_app
-from sglang_omni.serve.openai_api import _build_rollout_generate_request
+from sglang_omni.serve.openai_api import build_rollout_generate_request
 from sglang_omni.serve.protocol import RolloutGenerateRequest as RolloutRequest
 
 
-class _RolloutClient:
+class RolloutClient:
     """Captures the converted request and returns a canned CompletionResult."""
 
     def __init__(self, result: CompletionResult) -> None:
-        self._result = result
+        self.result = result
         self.requests: list[GenerateRequest] = []
 
     def health(self) -> dict[str, Any]:
@@ -37,10 +40,10 @@ class _RolloutClient:
     ) -> CompletionResult:
         del request_id, audio_format
         self.requests.append(request)
-        return self._result
+        return self.result
 
 
-def _text_result() -> CompletionResult:
+def text_result() -> CompletionResult:
     return CompletionResult(
         request_id="r1",
         text="hello world",
@@ -52,7 +55,7 @@ def _text_result() -> CompletionResult:
 
 
 def test_generate_returns_miles_meta_info() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -79,7 +82,7 @@ def test_generate_returns_miles_meta_info() -> None:
 
 
 def test_generate_returns_omni_rollout_when_present() -> None:
-    result = _text_result()
+    result = text_result()
     result.output_token_logprobs = None
     result.omni_rollout = {
         "version": 1,
@@ -88,7 +91,7 @@ def test_generate_returns_omni_rollout_when_present() -> None:
         "total_action_count": 1,
         "action_streams": [],
     }
-    client = _RolloutClient(result)
+    client = RolloutClient(result)
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -105,9 +108,9 @@ def test_generate_returns_omni_rollout_when_present() -> None:
 
 
 def test_generate_omits_omni_rollout_when_not_requested() -> None:
-    result = _text_result()
+    result = text_result()
     result.omni_rollout = {"version": 1, "action_streams": []}
-    client = _RolloutClient(result)
+    client = RolloutClient(result)
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -124,7 +127,7 @@ def test_generate_omits_omni_rollout_when_not_requested() -> None:
 
 
 def test_generate_rejects_missing_omni_rollout_when_requested() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -141,7 +144,7 @@ def test_generate_rejects_missing_omni_rollout_when_requested() -> None:
 
 
 def test_generate_omits_logprobs_when_not_requested() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -158,10 +161,10 @@ def test_generate_omits_logprobs_when_not_requested() -> None:
 
 
 def test_generate_preserves_empty_logprob_list_when_requested() -> None:
-    result = _text_result()
+    result = text_result()
     result.output_token_logprobs = []
     result.usage = UsageInfo(prompt_tokens=5, completion_tokens=0, total_tokens=5)
-    client = _RolloutClient(result)
+    client = RolloutClient(result)
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -178,9 +181,9 @@ def test_generate_preserves_empty_logprob_list_when_requested() -> None:
 
 
 def test_generate_rejects_missing_logprobs_when_requested() -> None:
-    result = _text_result()
+    result = text_result()
     result.output_token_logprobs = None
-    client = _RolloutClient(result)
+    client = RolloutClient(result)
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -196,11 +199,11 @@ def test_generate_rejects_missing_logprobs_when_requested() -> None:
     assert "output_token_logprobs" in resp.text
 
 
-def test_generate_audio_logprob_error_hints_omni_rollout() -> None:
-    result = _text_result()
+def test_generate_audio_requires_logprob_opt_out_without_omni_rollout() -> None:
+    result = text_result()
     result.output_token_logprobs = None
     result.audio = CompletionAudio(id="a1", data="QUJD", transcript="hello world")
-    client = _RolloutClient(result)
+    client = RolloutClient(result)
     tc = TestClient(create_app(client, model_name="higgs-audio"))
 
     resp = tc.post(
@@ -215,11 +218,22 @@ def test_generate_audio_logprob_error_hints_omni_rollout() -> None:
     assert resp.status_code == 501
     assert "return_omni_rollout=true" in resp.text
 
+    resp = tc.post(
+        "/generate",
+        json={
+            "prompt": "hi",
+            "output_modalities": ["audio"],
+            "return_logprob": False,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["audio"]["data"] == "QUJD"
+
 
 def test_generate_rejects_logprob_length_mismatch() -> None:
-    result = _text_result()
+    result = text_result()
     result.output_token_logprobs = [[-0.1, 11]]
-    client = _RolloutClient(result)
+    client = RolloutClient(result)
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -236,9 +250,9 @@ def test_generate_rejects_logprob_length_mismatch() -> None:
 
 
 def test_generate_echoes_null_weight_version_without_failing() -> None:
-    result = _text_result()
+    result = text_result()
     result.weight_version = None
-    client = _RolloutClient(result)
+    client = RolloutClient(result)
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -254,9 +268,9 @@ def test_generate_echoes_null_weight_version_without_failing() -> None:
 
 
 def test_generate_emits_audio_block_when_present() -> None:
-    result = _text_result()
+    result = text_result()
     result.audio = CompletionAudio(id="a1", data="QUJD", transcript="hello world")
-    client = _RolloutClient(result)
+    client = RolloutClient(result)
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -276,7 +290,7 @@ def test_generate_emits_audio_block_when_present() -> None:
 
 
 def test_generate_without_audio_returns_null_audio() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -289,7 +303,7 @@ def test_generate_without_audio_returns_null_audio() -> None:
 
 
 def test_generate_rejects_ambiguous_prompt_inputs() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -301,7 +315,7 @@ def test_generate_rejects_ambiguous_prompt_inputs() -> None:
 
 
 def test_generate_rejects_streaming_rollout_until_supported() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -319,7 +333,7 @@ def test_generate_rejects_streaming_rollout_until_supported() -> None:
 
 
 def test_generate_rejects_unknown_sampling_param() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -336,7 +350,7 @@ def test_generate_rejects_unknown_sampling_param() -> None:
 
 
 def test_generate_rejects_invalid_stop_type() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -353,7 +367,7 @@ def test_generate_rejects_invalid_stop_type() -> None:
 
 
 def test_generate_stage_sampling_bad_key_returns_422() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     resp = tc.post(
@@ -371,7 +385,7 @@ def test_generate_stage_sampling_bad_key_returns_422() -> None:
 
 
 def test_generate_rejects_message_without_role_or_content() -> None:
-    client = _RolloutClient(_text_result())
+    client = RolloutClient(text_result())
     tc = TestClient(create_app(client, model_name="qwen3-omni"))
 
     missing_role = tc.post(
@@ -396,15 +410,39 @@ def test_generate_rejects_message_without_role_or_content() -> None:
     assert client.requests == []
 
 
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        pytest.param("input_ids", [], id="empty-input-ids"),
+        pytest.param("messages", [], id="empty-messages"),
+        pytest.param("input_ids", [5, -1], id="negative-id"),
+        pytest.param("input_ids", [1 << 63], id="id-above-int64"),
+        pytest.param("input_ids", [1 << 64], id="id-above-uint64"),
+        pytest.param("input_ids", [-1] * 20000, id="long-invalid-list"),
+    ],
+)
+def test_generate_rejects_invalid_prompt_lists(field: str, value: list[int]) -> None:
+    client = RolloutClient(text_result())
+    tc = TestClient(create_app(client, model_name="qwen3-omni"))
+
+    resp = tc.post("/generate", json={field: value, "sampling_params": {}})
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert len(detail) == 1
+    assert detail[0]["loc"] == ["body", field]
+    assert client.requests == []
+
+
 def test_converter_maps_input_ids_to_prompt_token_ids() -> None:
     req = RolloutRequest(
-        input_ids=[1, 2, 3],
+        input_ids=[0, 2, (1 << 63) - 1],
         sampling_params={"temperature": 0.5, "max_new_tokens": 8},
         return_logprob=True,
     )
-    gen = _build_rollout_generate_request(req)
+    gen = build_rollout_generate_request(req)
 
-    assert gen.prompt_token_ids == [1, 2, 3]
+    assert gen.prompt_token_ids == [0, 2, (1 << 63) - 1]
     assert gen.prompt is None
     assert gen.messages is None
     assert gen.sampling.temperature == 0.5
@@ -413,12 +451,67 @@ def test_converter_maps_input_ids_to_prompt_token_ids() -> None:
     assert gen.extra_params["return_logprob"] is True
 
 
+def test_converter_omits_explicit_params_when_sampling_omitted() -> None:
+    req = RolloutRequest(prompt="hi", sampling_params={})
+
+    gen = build_rollout_generate_request(req)
+
+    assert gen.sampling.temperature == 1.0
+    assert gen.sampling.top_p == 1.0
+    assert gen.sampling.top_k == -1
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in gen.metadata
+
+
+def test_converter_preserves_explicit_rollout_sampling_default_values() -> None:
+    req = RolloutRequest(
+        prompt="hi",
+        sampling_params={"temperature": 1.0, "top_p": 1.0, "top_k": -1},
+    )
+
+    gen = build_rollout_generate_request(req)
+
+    assert gen.sampling.temperature == 1.0
+    assert gen.sampling.top_p == 1.0
+    assert gen.sampling.top_k == -1
+    assert gen.metadata[EXPLICIT_GENERATION_PARAMS_KEY] == [
+        "temperature",
+        "top_k",
+        "top_p",
+    ]
+
+
+def test_converter_does_not_mark_null_rollout_sampling_params_explicit() -> None:
+    req = RolloutRequest(
+        prompt="hi",
+        sampling_params={"temperature": None, "top_p": None, "top_k": None},
+    )
+
+    gen = build_rollout_generate_request(req)
+
+    assert gen.sampling.temperature == 1.0
+    assert gen.sampling.top_p == 1.0
+    assert gen.sampling.top_k == -1
+    assert EXPLICIT_GENERATION_PARAMS_KEY not in gen.metadata
+
+
+def test_converter_preserves_rollout_metadata() -> None:
+    req = RolloutRequest(
+        prompt="hi",
+        sampling_params={},
+        metadata={"rollout_id": 1},
+    )
+
+    gen = build_rollout_generate_request(req)
+
+    assert gen.metadata == {"rollout_id": 1}
+
+
 def test_converter_preserves_prompt_as_raw_rollout_input() -> None:
     from sglang_omni.client import Client
 
     req = RolloutRequest(prompt="hi", sampling_params={})
-    gen = _build_rollout_generate_request(req)
-    omni = Client._build_omni_request(gen)
+    gen = build_rollout_generate_request(req)
+    omni = Client.build_omni_request(gen)
 
     assert gen.prompt == "hi"
     assert gen.prompt_token_ids is None
@@ -433,8 +526,8 @@ def test_converter_preserves_messages_as_chat_rollout_input() -> None:
         messages=[{"role": "user", "content": "hi"}],
         sampling_params={},
     )
-    gen = _build_rollout_generate_request(req)
-    omni = Client._build_omni_request(gen)
+    gen = build_rollout_generate_request(req)
+    omni = Client.build_omni_request(gen)
 
     assert gen.prompt is None
     assert gen.prompt_token_ids is None
@@ -446,7 +539,7 @@ def test_converter_preserves_messages_as_chat_rollout_input() -> None:
 
 def test_converter_defaults_rollout_to_text_output_modality() -> None:
     req = RolloutRequest(prompt="hi", sampling_params={})
-    gen = _build_rollout_generate_request(req)
+    gen = build_rollout_generate_request(req)
 
     assert gen.output_modalities == ["text"]
 
@@ -457,7 +550,7 @@ def test_converter_preserves_explicit_output_modalities() -> None:
         sampling_params={},
         output_modalities=["text", "audio"],
     )
-    gen = _build_rollout_generate_request(req)
+    gen = build_rollout_generate_request(req)
 
     assert gen.output_modalities == ["text", "audio"]
 
@@ -466,8 +559,8 @@ def test_converter_threads_return_logprob_into_omni_params() -> None:
     from sglang_omni.client import Client
 
     req = RolloutRequest(prompt="hi", sampling_params={}, return_logprob=True)
-    gen = _build_rollout_generate_request(req)
-    omni = Client._build_omni_request(gen)
+    gen = build_rollout_generate_request(req)
+    omni = Client.build_omni_request(gen)
 
     assert omni.params.get("return_logprob") is True
 
@@ -477,3 +570,58 @@ def test_converter_defaults_stream_false_and_logprob_true() -> None:
     assert req.stream is False
     assert req.return_logprob is True
     assert req.return_omni_rollout is False
+
+
+def tensor_spec(**overrides: Any) -> dict[str, Any]:
+    spec = {
+        "dtype": "float32",
+        "shape": [1],
+        "data": base64.b64encode(b"\x00\x00\x00\x00").decode(),
+    }
+    spec.update(overrides)
+    return spec
+
+
+def test_generate_accepts_valid_multimodal_train_inputs() -> None:
+    client = RolloutClient(text_result())
+    tc = TestClient(create_app(client, model_name="qwen3-omni"))
+
+    resp = tc.post(
+        "/generate",
+        json={
+            "input_ids": [1, 2],
+            "multimodal_train_inputs": {
+                "version": 1,
+                "tensors": {"pixel_values": tensor_spec()},
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    assert len(client.requests) == 1
+
+
+def test_generate_rejects_malformed_multimodal_tensor_specs() -> None:
+    client = RolloutClient(text_result())
+    tc = TestClient(create_app(client, model_name="qwen3-omni"))
+    bad_specs = [
+        tensor_spec(dtype="foobar"),
+        tensor_spec(dtype="load"),
+        tensor_spec(shape=[2, 2]),
+        tensor_spec(data="!!!not-base64!!!"),
+    ]
+
+    for spec in bad_specs:
+        resp = tc.post(
+            "/generate",
+            json={
+                "input_ids": [1, 2],
+                "multimodal_train_inputs": {
+                    "version": 1,
+                    "tensors": {"pixel_values": spec},
+                },
+            },
+        )
+        assert resp.status_code == 422, spec
+
+    assert client.requests == []

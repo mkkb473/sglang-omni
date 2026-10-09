@@ -26,6 +26,7 @@ class ScenarioResult:
     endpoint: str
     category: str
     capability_key: str | None = None
+    workload: str | None = None
     stage_id: str | None = None
     load_mode: str | None = None
     load_concurrency: int | None = None
@@ -41,6 +42,8 @@ class ScenarioResult:
     http_status: int | None = None
     http_status_class: str | None = None
     latency_s: float = 0.0
+    configured_offset_s: float | None = None
+    collision_epoch_s: float | None = None
     planned_start_s: float | None = None
     actual_start_s: float | None = None
     completed_s: float | None = None
@@ -57,6 +60,9 @@ class ScenarioResult:
     batch_size: int | None = None
     audio_duration_s: float = 0.0
     rtf: float = 0.0
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    engine_time_s: float | None = None
     error_type: str | None = None
     error_class: str | None = None
     error: str | None = None
@@ -67,6 +73,7 @@ class ScenarioResult:
     ws_active_sample_rate: int | None = None
     ws_active_sentence_bytes: int = 0
     ws_completed_sentences: int = 0
+    ws_close_code: int | None = None
     ws_close_reason: str | None = None
     was_cancelled: bool = False
 

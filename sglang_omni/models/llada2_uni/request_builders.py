@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from array import array
+from collections.abc import Mapping
 
 import torch
+from sglang.srt.dllm.config import DllmConfig
+from transformers import PreTrainedTokenizerBase
 
 from sglang_omni.models.llada2_uni.components.preprocessor import (
     DUMMY_IMAGE_TOKEN_ID,
@@ -28,13 +31,17 @@ def build_encoder_request(
     state: LLaDA2UniPipelineState,
     *,
     stage_name: str,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Build encoder request dict from pipeline state."""
     inputs = state.encoder_inputs.get(stage_name)
     if not isinstance(inputs, dict) or not inputs:
         return {"_skip": True, "_result": {}}
+    else:
+        pass
     if inputs.get("_skip"):
         return {"_skip": True, "_result": inputs.get("_result", {})}
+    else:
+        pass
     return dict(inputs)
 
 
@@ -42,7 +49,7 @@ def apply_encoder_result(
     state: LLaDA2UniPipelineState,
     *,
     stage_name: str,
-    result: Any,
+    result: dict[str, list[list[int]]],
 ) -> None:
     """Apply encoder result to pipeline state."""
     state.encoder_outs[stage_name] = result
@@ -57,18 +64,26 @@ def merge_image_tokens_for_thinker(state: LLaDA2UniPipelineState) -> None:
     image_out = state.encoder_outs.get(IMAGE_STAGE)
     if not image_out:
         return
+    else:
+        pass
 
     image_token_ids_list = image_out.get("image_token_ids")
     if not image_token_ids_list:
         return
+    else:
+        pass
 
     prompt = state.prompt
     if not isinstance(prompt, dict) or "input_ids" not in prompt:
         return
+    else:
+        pass
 
     input_ids = prompt["input_ids"]
     if isinstance(input_ids, torch.Tensor):
         input_ids = input_ids.flatten().tolist()
+    else:
+        pass
 
     all_vq_tokens = []
     for token_ids in image_token_ids_list:
@@ -76,6 +91,8 @@ def merge_image_tokens_for_thinker(state: LLaDA2UniPipelineState) -> None:
 
     if not all_vq_tokens:
         return
+    else:
+        pass
 
     new_ids = []
     vq_idx = 0
@@ -85,6 +102,8 @@ def merge_image_tokens_for_thinker(state: LLaDA2UniPipelineState) -> None:
                 raise ValueError(
                     f"More placeholders than VQ tokens ({len(all_vq_tokens)})"
                 )
+            else:
+                pass
             new_ids.append(all_vq_tokens[vq_idx])
             vq_idx += 1
         else:
@@ -95,6 +114,8 @@ def merge_image_tokens_for_thinker(state: LLaDA2UniPipelineState) -> None:
             f"VQ token count mismatch: {len(all_vq_tokens)} VQ tokens "
             f"but only {vq_idx} placeholders"
         )
+    else:
+        pass
 
     prompt["input_ids"] = torch.tensor([new_ids], dtype=torch.long)
 
@@ -102,10 +123,10 @@ def merge_image_tokens_for_thinker(state: LLaDA2UniPipelineState) -> None:
 def build_dllm_thinker_request(
     state: LLaDA2UniPipelineState,
     *,
-    params: dict[str, Any],
-    tokenizer: Any,
+    params: Mapping[str, object],
+    tokenizer: PreTrainedTokenizerBase,
     vocab_size: int,
-    dllm_config: Any,
+    dllm_config: DllmConfig,
     request_id: str | None = None,
 ) -> SGLangDLLMRequestData:
     """Build SGLangDLLMRequestData for the LLaDA2-Uni thinker."""
@@ -115,12 +136,16 @@ def build_dllm_thinker_request(
     prompt = state.prompt
     if not isinstance(prompt, dict):
         raise TypeError("prompt missing for thinker request")
+    else:
+        pass
 
     input_ids = prompt.get("input_ids")
     if not isinstance(input_ids, torch.Tensor):
         raise TypeError("prompt.input_ids must be a torch.Tensor")
+    else:
+        pass
 
-    input_ids_list = input_ids.to(dtype=torch.long).flatten().tolist()
+    input_ids_array = array("q", input_ids.to(dtype=torch.long).flatten().tolist())
 
     sampling_params = SamplingParams(
         max_new_tokens=params.get("max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS),
@@ -143,7 +168,7 @@ def build_dllm_thinker_request(
     req = Req(
         rid=rid,
         origin_input_text="",
-        origin_input_ids=input_ids_list,
+        origin_input_ids=input_ids_array,
         sampling_params=sampling_params,
         vocab_size=vocab_size,
         eos_token_ids=eos_token_ids,
@@ -152,7 +177,7 @@ def build_dllm_thinker_request(
     req.tokenizer = tokenizer
 
     req.omni_model_inputs = None
-    req._omni_consumed = None
+    req._omni_consumed = None  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
     data = SGLangDLLMRequestData(
         output_ids=req.output_ids,
@@ -175,6 +200,8 @@ def apply_dllm_thinker_result(
     }
     if finish_reason is not None:
         thinker_out["finish_reason"] = finish_reason
+    else:
+        pass
 
     state.thinker_out = thinker_out
     state.engine_outputs[stage_name] = thinker_out
@@ -183,9 +210,9 @@ def apply_dllm_thinker_result(
 
 def make_dllm_thinker_scheduler_adapters(
     *,
-    tokenizer: Any,
+    tokenizer: PreTrainedTokenizerBase,
     vocab_size: int,
-    dllm_config: Any,
+    dllm_config: DllmConfig,
     stage_name: str = THINKER_STAGE,
 ):
     """Build StagePayload <-> scheduler adapters for the dLLM thinker."""

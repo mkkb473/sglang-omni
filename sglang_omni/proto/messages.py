@@ -1,127 +1,234 @@
 # SPDX-License-Identifier: Apache-2.0
 """Control plane messages."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Literal, TypeAlias, TypedDict
 
-from sglang_omni.proto.admin import AdminOperation, AdminResult
+import msgspec
+
+from sglang_omni.proto.admin import AdminOperation, AdminResult, SerializedAdminResult
+from sglang_omni.proto.kv_transfer import (
+    KVTransferPrepareMessage,
+    KVTransferReadyMessage,
+)
 from sglang_omni.proto.request import StagePayload
+
+
+class DirectCudaIpcTensor(TypedDict):
+    path: str
+    tensor_bytes: bytes
+
+
+class DirectCudaIpcPayloadRef(TypedDict):
+    _type: Literal["TorchCudaIpcPayload"]
+    version: Literal[1]
+    header: bytes
+    tensors: list[DirectCudaIpcTensor]
+
+
+class DirectCudaIpcStreamChunkOptionalFields(TypedDict, total=False):
+    metadata: dict[str, object]
+
+
+class DirectCudaIpcStreamChunkRef(DirectCudaIpcStreamChunkOptionalFields):
+    _type: Literal["TorchCudaIpcStreamChunk"]
+    version: Literal[1]
+    tensor_bytes: bytes
+
+
+class InlineStreamChunkRef(TypedDict):
+    _type: Literal["InlineStreamChunk"]
+    version: Literal[1]
+    payload: bytes
+
+
+StageDataRef: TypeAlias = (
+    DirectCudaIpcPayloadRef | DirectCudaIpcStreamChunkRef | InlineStreamChunkRef
+)
 
 
 @dataclass
 class DataReadyMessage:
-    """Notify next stage that data is ready.
-
-    Supports different metadata formats:
-    - Simple dict (for current NixlRelay with transfer_info)
-    - SHMMetadata (for backward compatibility)
-    - RdmaMetadata (for other relay types)
-    """
+    """Notify next stage that a data-plane object is ready."""
 
     request_id: str
     from_stage: str
     to_stage: str
-    shm_metadata: Any  # Can be dict, SHMMetadata, or RdmaMetadata
+    data_ref: dict[str, object] | StageDataRef | None
     chunk_id: int | None = None
     is_done: bool = False
     error: str | None = None
+    replica_bindings: dict[str, int] | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        # Handle different metadata types
-        if isinstance(self.shm_metadata, dict):
-            # Simple dict (current NixlRelay format)
-            metadata_dict = self.shm_metadata.copy()
-            metadata_dict["_type"] = "dict"  # Mark as simple dict
-        elif hasattr(self.shm_metadata, "to_dict"):
-            # SHMMetadata
-            metadata_dict = self.shm_metadata.to_dict()
-        elif hasattr(self.shm_metadata, "model_dump"):
-            # RdmaMetadata (Pydantic BaseModel)
-            metadata_dict = self.shm_metadata.model_dump()
-            metadata_dict["_type"] = "RdmaMetadata"  # Mark as RdmaMetadata
+    def to_dict(self) -> dict[str, object]:
+        require_str(self.request_id, "request_id")
+        require_str(self.from_stage, "from_stage")
+        require_str(self.to_stage, "to_stage")
+        require_bool(self.is_done, "is_done")
+        if self.is_done and self.error is not None:
+            raise ValueError("stream signal cannot be both done and error")
         else:
-            # Fallback: try to convert to dict
-            metadata_dict = (
-                dict(self.shm_metadata)
-                if hasattr(self.shm_metadata, "__dict__")
-                else {}
+            pass
+        if self.is_done or self.error is not None:
+            if self.data_ref is not None:
+                raise ValueError("stream signal must not carry data_ref")
+            else:
+                pass
+            if self.chunk_id is not None:
+                raise ValueError("stream signal must not carry chunk_id")
+            else:
+                pass
+        elif not isinstance(self.data_ref, dict):
+            raise TypeError(
+                "DataReadyMessage.data_ref must be dict for data messages, got "
+                f"{type(self.data_ref).__name__}"
             )
-
-        d = {
+        else:
+            pass
+        d: dict[str, object] = {
             "type": "data_ready",
             "request_id": self.request_id,
             "from_stage": self.from_stage,
             "to_stage": self.to_stage,
-            "shm_metadata": metadata_dict,
         }
+        if self.data_ref is not None:
+            d["data_ref"] = self.data_ref.copy()
+        else:
+            pass
         if self.chunk_id is not None:
+            require_non_negative_int(self.chunk_id, "chunk_id")
             d["chunk_id"] = self.chunk_id
+        else:
+            pass
         if self.is_done:
             d["is_done"] = True
+        else:
+            pass
         if self.error is not None:
+            require_str(self.error, "error")
             d["error"] = self.error
+        else:
+            pass
+        if self.replica_bindings:
+            d["replica_bindings"] = dict(self.replica_bindings)
+        else:
+            pass
         return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "DataReadyMessage":
-        metadata_dict = d["shm_metadata"]
-
-        # Determine metadata type based on _type field first
-        metadata_type = metadata_dict.get("_type", "")
-
-        if metadata_type == "dict" or "transfer_info" in metadata_dict:
-            # Simple dict format (current NixlRelay design)
-            # Remove _type marker if present
-            metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
-        elif metadata_type == "RdmaMetadata":
-            # Try to import RdmaMetadata if available
-            try:
-                from sglang_omni.relay.operations.nixl import RdmaMetadata
-
-                clean_dict = {
-                    k: v
-                    for k, v in metadata_dict.items()
-                    if k not in ["_type", "shm_segments"]
-                }
-                metadata = RdmaMetadata(**clean_dict)
-            except (ImportError, Exception):
-                # Fallback to dict if RdmaMetadata not available
-                metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
-        elif metadata_type == "SHMMetadata" or "shm_segments" in metadata_dict:
-            # Try to import SHMMetadata if available
-            try:
-                from sglang_omni.relay.nixl import SHMMetadata
-
-                metadata = SHMMetadata.from_dict(metadata_dict)
-            except (ImportError, Exception):
-                # Fallback to dict if SHMMetadata not available
-                metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
-        elif "descriptors" in metadata_dict:
-            # Has descriptors but no _type - try RdmaMetadata first, fallback to dict
-            try:
-                from sglang_omni.relay.operations.nixl import RdmaMetadata
-
-                clean_dict = {
-                    k: v
-                    for k, v in metadata_dict.items()
-                    if k not in ["_type", "shm_segments"]
-                }
-                metadata = RdmaMetadata(**clean_dict)
-            except (ImportError, Exception):
-                # Fallback to dict
-                metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
+    def from_dict(cls, d: Mapping[str, object]) -> "DataReadyMessage":
+        request_id = require_str(d.get("request_id"), "request_id")
+        from_stage = require_str(d.get("from_stage"), "from_stage")
+        to_stage = require_str(d.get("to_stage"), "to_stage")
+        data_ref = d.get("data_ref")
+        raw_is_done = d.get("is_done", False)
+        is_done = require_bool(raw_is_done, "is_done")
+        error = d.get("error")
+        if error is not None:
+            error = require_str(error, "error")
         else:
-            # Default: use as dict (for current NixlRelay)
-            metadata = {k: v for k, v in metadata_dict.items() if k != "_type"}
+            pass
+        if is_done and error is not None:
+            raise ValueError("stream signal cannot be both done and error")
+        else:
+            pass
+        if is_done or error is not None:
+            if data_ref is not None:
+                raise ValueError("stream signal must not carry data_ref")
+            else:
+                pass
+            if "chunk_id" in d:
+                raise ValueError("stream signal must not carry chunk_id")
+            else:
+                pass
+        elif not isinstance(data_ref, dict):
+            raise TypeError(
+                "data_ready data_ref must be dict for data messages, got "
+                f"{type(data_ref).__name__}"
+            )
+        else:
+            pass
+        chunk_id = d.get("chunk_id")
+        if chunk_id is not None:
+            require_non_negative_int(chunk_id, "chunk_id")
+        else:
+            pass
 
         return cls(
-            request_id=d["request_id"],
-            from_stage=d["from_stage"],
-            to_stage=d["to_stage"],
-            shm_metadata=metadata,
-            chunk_id=d.get("chunk_id"),
-            is_done=d.get("is_done", False),
-            error=d.get("error"),
+            request_id=request_id,
+            from_stage=from_stage,
+            to_stage=to_stage,
+            data_ref=data_ref,
+            chunk_id=chunk_id,
+            is_done=is_done,
+            error=error,
+            replica_bindings=d.get("replica_bindings"),
+        )
+
+
+class DataAckMessage(msgspec.Struct):
+    """Receiver completion for one data-plane object."""
+
+    request_id: str
+    from_stage: str
+    to_stage: str
+    object_id: str
+    success: bool = True
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, str | bool]:
+        require_str(self.request_id, "request_id")
+        require_str(self.from_stage, "from_stage")
+        require_str(self.to_stage, "to_stage")
+        require_str(self.object_id, "object_id")
+        if not isinstance(self.success, bool):
+            raise TypeError("success must be bool")
+        else:
+            pass
+        if self.success:
+            if self.error is not None:
+                raise ValueError("successful data ack must not carry error")
+            else:
+                pass
+        else:
+            require_str(self.error, "error")
+        d: dict[str, str | bool] = {
+            "type": "data_ack",
+            "request_id": self.request_id,
+            "from_stage": self.from_stage,
+            "to_stage": self.to_stage,
+            "object_id": self.object_id,
+            "success": self.success,
+        }
+        if self.error is not None:
+            d["error"] = self.error
+        else:
+            pass
+        return d
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, object]) -> "DataAckMessage":
+        success = d.get("success")
+        if not isinstance(success, bool):
+            raise TypeError("data_ack success must be bool")
+        else:
+            pass
+        error = d.get("error")
+        if success:
+            if error is not None:
+                raise ValueError("successful data_ack must not carry error")
+            else:
+                pass
+        else:
+            error = require_str(error, "error")
+        return cls(
+            request_id=require_str(d.get("request_id"), "request_id"),
+            from_stage=require_str(d.get("from_stage"), "from_stage"),
+            to_stage=require_str(d.get("to_stage"), "to_stage"),
+            object_id=require_str(d.get("object_id"), "object_id"),
+            success=success,
+            error=error,
         )
 
 
@@ -131,11 +238,11 @@ class AbortMessage:
 
     request_id: str
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, str]:
         return {"type": "abort", "request_id": self.request_id}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "AbortMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "AbortMessage":
         return cls(request_id=d["request_id"])
 
 
@@ -146,10 +253,10 @@ class CompleteMessage:
     request_id: str
     from_stage: str
     success: bool
-    result: Any = None
+    result: object = None
     error: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         return {
             "type": "complete",
             "request_id": self.request_id,
@@ -160,7 +267,7 @@ class CompleteMessage:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "CompleteMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "CompleteMessage":
         return cls(
             request_id=d["request_id"],
             from_stage=d["from_stage"],
@@ -176,14 +283,14 @@ class StreamMessage:
 
     request_id: str
     from_stage: str
-    chunk: Any
+    chunk: object
     stage_id: int | None = None
     stage_name: str | None = None
     modality: str | None = None
     chunk_id: int | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        d = {
+    def to_dict(self) -> dict[str, object]:
+        d: dict[str, object] = {
             "type": "stream",
             "request_id": self.request_id,
             "from_stage": self.from_stage,
@@ -194,10 +301,12 @@ class StreamMessage:
         }
         if self.chunk_id is not None:
             d["chunk_id"] = self.chunk_id
+        else:
+            pass
         return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "StreamMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "StreamMessage":
         return cls(
             request_id=d["request_id"],
             from_stage=d["from_stage"],
@@ -214,31 +323,45 @@ class SubmitMessage:
     """Submit a new request to the entry stage."""
 
     request_id: str
-    data: Any
+    data: object
+    replica_bindings: dict[str, int] | None = None
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         data = self.data
         if isinstance(self.data, StagePayload):
             data = self.data.to_dict()
-        return {"type": "submit", "request_id": self.request_id, "data": data}
+        else:
+            pass
+        d = {"type": "submit", "request_id": self.request_id, "data": data}
+        if self.replica_bindings:
+            d["replica_bindings"] = dict(self.replica_bindings)
+        else:
+            pass
+        return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SubmitMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "SubmitMessage":
         data = d["data"]
         if isinstance(data, dict) and data.get("_type") == "StagePayload":
             data = StagePayload.from_dict(data)
-        return cls(request_id=d["request_id"], data=data)
+        else:
+            pass
+        return cls(
+            request_id=d["request_id"],
+            data=data,
+            replica_bindings=d.get("replica_bindings"),
+        )
 
 
 @dataclass
 class ShutdownMessage:
     """Signal graceful shutdown to a stage."""
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, str]:
         return {"type": "shutdown"}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ShutdownMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "ShutdownMessage":
         return cls()
 
 
@@ -251,7 +374,7 @@ class ProfilerStartMessage:
     event_dir: str | None = None  # Per-stage JSONL event sink dir for request profiling
     enable_torch: bool = True  # When False, only request-level events are captured
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, str | bool | None]:
         return {
             "type": "profiler_start",
             "run_id": self.run_id,
@@ -261,7 +384,7 @@ class ProfilerStartMessage:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ProfilerStartMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "ProfilerStartMessage":
         return cls(
             run_id=d["run_id"],
             trace_path_template=d["trace_path_template"],
@@ -276,11 +399,11 @@ class ProfilerStopMessage:
 
     run_id: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, str | None]:
         return {"type": "profiler_stop", "run_id": self.run_id}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ProfilerStopMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "ProfilerStopMessage":
         return cls(run_id=d.get("run_id"))
 
 
@@ -290,11 +413,11 @@ class AdminMessage:
 
     operation: AdminOperation
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, str | dict[str, object]]:
         return {"type": "admin", "operation": self.operation.to_dict()}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "AdminMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "AdminMessage":
         return cls(operation=AdminOperation.from_dict(d["operation"]))
 
 
@@ -304,20 +427,23 @@ class AdminResultMessage:
 
     result: AdminResult
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, str | SerializedAdminResult]:
         return {"type": "admin_result", "result": self.result.to_dict()}
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "AdminResultMessage":
+    def from_dict(cls, d: Mapping[str, object]) -> "AdminResultMessage":
         return cls(result=AdminResult.from_dict(d["result"]))
 
 
 def parse_message(
-    d: dict[str, Any],
+    d: Mapping[str, object],
 ) -> (
     AdminMessage
     | AdminResultMessage
+    | DataAckMessage
     | DataReadyMessage
+    | KVTransferPrepareMessage
+    | KVTransferReadyMessage
     | AbortMessage
     | CompleteMessage
     | StreamMessage
@@ -330,6 +456,12 @@ def parse_message(
     msg_type = d.get("type")
     if msg_type == "data_ready":
         return DataReadyMessage.from_dict(d)
+    elif msg_type == "data_ack":
+        return DataAckMessage.from_dict(d)
+    elif msg_type == "kv_transfer_prepare":
+        return KVTransferPrepareMessage.from_dict(d)
+    elif msg_type == "kv_transfer_ready":
+        return KVTransferReadyMessage.from_dict(d)
     elif msg_type == "abort":
         return AbortMessage.from_dict(d)
     elif msg_type == "complete":
@@ -350,3 +482,27 @@ def parse_message(
         return AdminResultMessage.from_dict(d)
     else:
         raise ValueError(f"Unknown message type: {msg_type}")
+
+
+def require_str(value: object, name: str) -> str:
+    if not isinstance(value, str) or value == "":
+        raise TypeError(f"{name} must be a non-empty str")
+    else:
+        pass
+    return value
+
+
+def require_bool(value: object, name: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{name} must be bool")
+    else:
+        pass
+    return value
+
+
+def require_non_negative_int(value: object, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise TypeError(f"{name} must be a non-negative int")
+    else:
+        pass
+    return value

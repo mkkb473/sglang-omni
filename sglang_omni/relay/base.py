@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Type
+from collections.abc import Mapping
+from typing import Dict, Optional, Type
 
 import torch
 
@@ -26,6 +27,8 @@ def register_relay(name: str):
     def decorator(cls):
         if name in RELAY_REGISTRY:
             logger.warning(f"Relay type '{name}' is already registered. Overwriting!")
+        else:
+            pass
         RELAY_REGISTRY[name] = cls
         return cls
 
@@ -43,21 +46,29 @@ def create_relay(relay_type: str, **kwargs) -> Relay:
         # Try dynamic import to trigger registration
         try:
             if relay_type == "nccl":
-                from .nccl import NcclRelay  # noqa
+                from .nccl import NcclRelay  # noqa: F401 - Register backend.
+            elif relay_type == "cuda_ipc":
+                from .cuda_ipc import CudaIpcRelay  # noqa: F401 - Register backend.
             elif relay_type == "shm":
-                from .shm import ShmRelay  # noqa
+                from .shm import ShmRelay  # noqa: F401 - Register backend.
             elif relay_type == "nixl":
-                from .nixl import NixlRelay  # noqa
+                from .nixl import NixlRelay  # noqa: F401 - Register backend.
             elif relay_type == "mooncake":
-                from .mooncake import MooncakeRelay  # noqa
+                from .mooncake import MooncakeRelay  # noqa: F401 - Register backend.
+            else:
+                pass
         except ImportError:
             pass
+    else:
+        pass
 
     if relay_type not in RELAY_REGISTRY:
         available = list(RELAY_REGISTRY.keys())
         raise ValueError(
             f"Unknown relay type: '{relay_type}'. Available types: {available}"
         )
+    else:
+        pass
 
     relay_cls = RELAY_REGISTRY[relay_type]
 
@@ -71,6 +82,8 @@ def create_relay(relay_type: str, **kwargs) -> Relay:
             # If class accepts **kwargs, pass all remaining parameters
             valid_kwargs.update(kwargs)
             break
+        else:
+            pass
 
     return relay_cls(**valid_kwargs)
 
@@ -80,12 +93,22 @@ class RelayOperation(ABC):
 
     @property
     @abstractmethod
-    def metadata(self) -> Any:
+    def metadata(self) -> Mapping[str, object] | None:
         """Returns metadata required by the receiver (e.g., SHM name, memory pointer)."""
 
     @abstractmethod
     async def wait_for_completion(self, timeout: float = 30.0) -> None:
         """Asynchronously waits for the transfer or copy to complete."""
+
+    def mark_receiver_done(self) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support receiver ack"
+        )
+
+    def mark_receiver_failed(self, exc: BaseException) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support receiver ack"
+        )
 
 
 class Relay(ABC):
@@ -93,16 +116,25 @@ class Relay(ABC):
 
     @abstractmethod
     async def put_async(
-        self, tensor: torch.Tensor, request_id: str = None, dst_rank: int = None
+        self,
+        tensor: torch.Tensor,
+        request_id: str | None = None,
+        dst_rank: int | None = None,
+        receiver_id: str | None = None,
     ) -> RelayOperation:
         """
         Asynchronously sends a tensor.
+        ``receiver_id`` names the destination import owner when a backend
+        resource carries one-consumer ownership.
         Returns an operation handle containing metadata for the receiver.
         """
 
     @abstractmethod
     async def get_async(
-        self, metadata: Any, dest_tensor: torch.Tensor, request_id: str = None
+        self,
+        metadata: dict[str, object],
+        dest_tensor: torch.Tensor,
+        request_id: str | None = None,
     ) -> RelayOperation:
         """
         Asynchronously retrieves data into dest_tensor using provided metadata.
@@ -135,24 +167,24 @@ class CreditAllocator:
         self.credits = credits
         self.slot_size = slot_size
         self.base_ptr = base_ptr
-        self._free_credits = asyncio.Queue(maxsize=credits)
+        self.free_credits = asyncio.Queue(maxsize=credits)
 
         # Initialize credits
         for i in range(credits):
             if slot_size is not None:
                 # Memory mode: return offsets
-                self._free_credits.put_nowait(i * slot_size)
+                self.free_credits.put_nowait(i * slot_size)
             else:
                 # Simple mode: return credit IDs
-                self._free_credits.put_nowait(i)
+                self.free_credits.put_nowait(i)
 
     async def acquire_async(self) -> int:
         """Acquire a credit (blocks if none available)."""
-        return await self._free_credits.get()
+        return await self.free_credits.get()
 
     def release(self, credit_id: int):
         """Release a credit back to the pool."""
         try:
-            self._free_credits.put_nowait(credit_id)
+            self.free_credits.put_nowait(credit_id)
         except asyncio.QueueFull:
             logger.error("Attempted to release credit to a full pool!")
